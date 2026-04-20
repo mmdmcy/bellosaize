@@ -1,0 +1,25 @@
+/target
+
+# Editors
+/.idea
+/.vscode
+*.swp
+*.swo
+*~
+
+# OS / local junk
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.log
+
+# Environment / local overrides
+.env
+.env.*
+!.env.example
+.direnv/
+
+# Patch / merge leftovers
+*.orig
+*.rej
