@@ -1008,7 +1008,7 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
 
 fn launch_terminal_process(state: &SharedState, session: &Rc<SessionView>) -> Result<()> {
     let spec = session.spec.borrow().clone();
-    let argv = parse_command(&spec.resolved_command())?;
+    let argv = spawn_argv(&spec)?;
     let argv_strings = argv.clone();
     let workdir = spec.cwd.to_string_lossy().to_string();
     let envv = spawn_environment();
@@ -1382,6 +1382,20 @@ fn parse_command(command: &str) -> Result<Vec<String>> {
     shlex::split(trimmed).ok_or_else(|| anyhow!("invalid command line: {trimmed}"))
 }
 
+fn spawn_argv(spec: &SessionSpec) -> Result<Vec<String>> {
+    let mut argv = parse_command(&spec.resolved_command())?;
+
+    if let Some(binary) = profile_binary_name(spec.profile) {
+        if argv.first().is_some_and(|arg| arg == binary) {
+            if let Some(resolved_path) = resolve_binary_from_shell(binary) {
+                argv[0] = resolved_path;
+            }
+        }
+    }
+
+    Ok(argv)
+}
+
 fn selected_project_path(state: &SharedState) -> Option<PathBuf> {
     let state = state.borrow();
     selected_project_ref(&state).map(|project| project.path.clone())
@@ -1456,6 +1470,15 @@ fn profile_css_class(profile: Profile) -> &'static str {
     }
 }
 
+fn profile_binary_name(profile: Profile) -> Option<&'static str> {
+    match profile {
+        Profile::Codex => Some("codex"),
+        Profile::Claude => Some("claude"),
+        Profile::Mistral => Some("mistral"),
+        Profile::Shell | Profile::Custom => None,
+    }
+}
+
 fn spawn_environment() -> Vec<String> {
     let mut envv = env::vars().collect::<BTreeMap<_, _>>();
     envv.extend(login_shell_environment());
@@ -1465,6 +1488,22 @@ fn spawn_environment() -> Vec<String> {
     envv.into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
+}
+
+fn resolve_binary_from_shell(binary: &str) -> Option<String> {
+    let shell = crate::persist::default_shell();
+    let command = format!("command -v {binary}");
+    let output = Command::new(&shell).args(["-lc", &command]).output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with('/'))
+        .map(ToOwned::to_owned)
 }
 
 fn login_shell_environment() -> BTreeMap<String, String> {
