@@ -85,12 +85,14 @@ cargo build --release
 2. Launch a pane from the top action row with `Shell`, `Codex`, `Claude`, `Mistral`, or `Custom`.
 3. Double-click a repository row if you want the fastest path to a shell in that folder.
 4. Click any pane to focus it.
-5. Double-click a pane header to zoom or unzoom it.
-6. Use the sidebar toggle if you want more room for terminals.
-7. Use `Commit+Push` on the focused pane when you want to stage, commit, and push from that repository.
+5. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
+6. Double-click a pane header to zoom or unzoom it.
+7. Use the sidebar toggle if you want more room for terminals.
+8. Use `Commit+Push` on the focused pane when you want to stage, commit, and push from that repository.
 
 Notes:
 
+- The `Codex` launcher starts Codex with `--dangerously-bypass-approvals-and-sandbox` by default.
 - If VTE reports a new current directory because you `cd` inside a shell, BelloSaize tracks that and uses it for git actions.
 - New panes grab keyboard focus immediately, and a plain click on another pane focuses it without leaving behind accidental text selection.
 - Closing the app stops the child processes. BelloSaize does not auto-restore terminals on the next launch.

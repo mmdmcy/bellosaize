@@ -51,6 +51,7 @@ struct AppState {
     workspace_repo_status_label: Label,
     status_label: Label,
     count_label: Label,
+    reset_button: Button,
     close_button: Button,
     zoom_button: Button,
     commit_push_button: Button,
@@ -107,6 +108,7 @@ struct WorkspaceWidgets {
     workspace_repo_status_label: Label,
     status_label: Label,
     count_label: Label,
+    reset_button: Button,
     launch_buttons: LaunchButtons,
     close_button: Button,
     zoom_button: Button,
@@ -153,6 +155,7 @@ fn build_ui(application: &Application) -> Result<()> {
         workspace_repo_status_label: workspace_widgets.workspace_repo_status_label,
         status_label: workspace_widgets.status_label,
         count_label: workspace_widgets.count_label,
+        reset_button: workspace_widgets.reset_button.clone(),
         close_button: workspace_widgets.close_button.clone(),
         zoom_button: workspace_widgets.zoom_button.clone(),
         commit_push_button: workspace_widgets.commit_push_button.clone(),
@@ -226,6 +229,11 @@ fn build_ui(application: &Application) -> Result<()> {
                 }
             }
         });
+    }
+    {
+        let state = state.clone();
+        let reset_button = state.borrow().reset_button.clone();
+        reset_button.connect_clicked(move |_| reset_selected_session(&state));
     }
     {
         let state = state.clone();
@@ -406,11 +414,16 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
     let pane_group = GtkBox::new(Orientation::Horizontal, 8);
     pane_group.add_css_class("toolbar-group");
 
+    let reset_button = action_button("Reset");
+    reset_button.set_tooltip_text(Some(
+        "Kill and relaunch the focused pane from scratch with the same command.",
+    ));
     let zoom_button = action_button("Zoom");
     let close_button = action_button("Close");
     let commit_push_button = action_button("Commit+Push");
     commit_push_button.add_css_class("primary-button");
 
+    pane_group.append(&reset_button);
     pane_group.append(&zoom_button);
     pane_group.append(&close_button);
     pane_group.append(&commit_push_button);
@@ -469,6 +482,7 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
             workspace_repo_status_label,
             status_label: footer.0,
             count_label: footer.1,
+            reset_button,
             launch_buttons: LaunchButtons {
                 shell_button,
                 codex_button,
@@ -886,6 +900,12 @@ fn focus_session_terminal(session: &Rc<SessionView>) {
     });
 }
 
+fn focus_selected_session_terminal(state: &SharedState) {
+    if let Some(session) = selected_session(state) {
+        focus_session_terminal(&session);
+    }
+}
+
 #[allow(deprecated)]
 fn prompt_custom_session(state: &SharedState, cwd_override: Option<PathBuf>) {
     let window = state.borrow().window.clone();
@@ -1248,6 +1268,7 @@ fn update_layout(state: &SharedState) {
         if total == 1 { "pane" } else { "panes" }
     ));
     let focused = state_mut.selected_session_id.is_some();
+    state_mut.reset_button.set_sensitive(focused);
     state_mut.close_button.set_sensitive(focused);
     state_mut.zoom_button.set_sensitive(focused);
     state_mut.commit_push_button.set_sensitive(focused);
@@ -1296,20 +1317,13 @@ fn select_session(state: &SharedState, id: u64) {
     update_layout(state);
 }
 
-fn close_selected_session(state: &SharedState) {
-    let Some(id) = state.borrow().selected_session_id else {
-        return;
-    };
-
-    let removed = {
+fn remove_session_by_id(state: &SharedState, id: u64) -> Option<Rc<SessionView>> {
+    let session = {
         let mut state_mut = state.borrow_mut();
-        let Some(index) = state_mut
+        let index = state_mut
             .sessions
             .iter()
-            .position(|session| session.id == id)
-        else {
-            return;
-        };
+            .position(|session| session.id == id)?;
 
         let session = state_mut.sessions.remove(index);
         if session.alive.get() {
@@ -1325,6 +1339,18 @@ fn close_selected_session(state: &SharedState) {
         session
     };
 
+    Some(session)
+}
+
+fn close_selected_session(state: &SharedState) {
+    let Some(id) = state.borrow().selected_session_id else {
+        return;
+    };
+
+    let Some(removed) = remove_session_by_id(state, id) else {
+        return;
+    };
+
     removed.card.unparent();
     if let Err(error) = persist_sessions(state) {
         show_output_dialog(
@@ -1334,10 +1360,53 @@ fn close_selected_session(state: &SharedState) {
         );
     }
     update_layout(state);
-    if let Some(session) = selected_session(state) {
-        focus_session_terminal(&session);
-    }
+    focus_selected_session_terminal(state);
     push_status(state, format!("closed {}", removed.spec.borrow().title()));
+}
+
+fn reset_selected_session(state: &SharedState) {
+    let Some(session) = selected_session(state) else {
+        return;
+    };
+
+    let id = session.id;
+    let spec = session.spec.borrow().clone();
+    let title = spec.title();
+    let was_zoomed = state.borrow().zoomed_session_id == Some(id);
+
+    let Some(removed) = remove_session_by_id(state, id) else {
+        return;
+    };
+
+    removed.card.unparent();
+    if let Err(error) = persist_sessions(state) {
+        show_output_dialog(
+            &state.borrow().window,
+            "Persistence Error",
+            &format!("{error:#}"),
+        );
+    }
+
+    update_layout(state);
+
+    if let Err(error) = spawn_session(state, spec) {
+        show_output_dialog(
+            &state.borrow().window,
+            "Reset Failed",
+            &format!("{error:#}"),
+        );
+        return;
+    }
+
+    if was_zoomed {
+        let new_id = state.borrow().selected_session_id;
+        if let Some(new_id) = new_id {
+            state.borrow_mut().zoomed_session_id = Some(new_id);
+            update_layout(state);
+        }
+    }
+
+    push_status(state, format!("reset {}", title));
 }
 
 fn toggle_zoom_selected(state: &SharedState) {

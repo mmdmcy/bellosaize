@@ -31,7 +31,7 @@ impl Profile {
     pub fn default_command(self) -> String {
         match self {
             Self::Shell => default_shell(),
-            Self::Codex => "codex".to_string(),
+            Self::Codex => "codex --dangerously-bypass-approvals-and-sandbox".to_string(),
             Self::Claude => "claude".to_string(),
             Self::Mistral => "mistral".to_string(),
             Self::Custom => String::new(),
@@ -166,7 +166,10 @@ mod tests {
     #[test]
     fn profile_defaults_are_stable() {
         assert_eq!(Profile::Shell.default_command(), default_shell());
-        assert_eq!(Profile::Codex.default_command(), "codex");
+        assert_eq!(
+            Profile::Codex.default_command(),
+            "codex --dangerously-bypass-approvals-and-sandbox"
+        );
         assert_eq!(Profile::Claude.default_command(), "claude");
         assert_eq!(Profile::Mistral.default_command(), "mistral");
     }
