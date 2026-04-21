@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     env,
     path::{Path, PathBuf},
     process::Command,
@@ -9,11 +10,11 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use gio::prelude::*;
 use gtk::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CssProvider, DropDown,
-    Entry, Grid, Label, Orientation, ResponseType, ScrolledWindow, Stack, TextBuffer, TextView,
-    gdk, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CssProvider, Entry,
+    Grid, Label, ListBox, Orientation, Paned, ResponseType, ScrolledWindow, Stack, TextBuffer,
+    TextView, gdk, prelude::*,
 };
-use pango::FontDescription;
+use pango::{EllipsizeMode, FontDescription};
 use vte::{CursorBlinkMode, PtyFlags, Terminal, prelude::*};
 
 use crate::{
@@ -40,9 +41,13 @@ struct AppState {
     window: ApplicationWindow,
     stack: Stack,
     grid: Grid,
-    empty_state: GtkBox,
-    project_dropdown: DropDown,
-    project_model: gtk::StringList,
+    root_paned: Paned,
+    sidebar: GtkBox,
+    sidebar_toggle_button: Button,
+    project_list: ListBox,
+    project_count_label: Label,
+    workspace_title_label: Label,
+    workspace_path_label: Label,
     status_label: Label,
     count_label: Label,
     close_button: Button,
@@ -51,9 +56,12 @@ struct AppState {
     session_file_path: PathBuf,
     project_roots: Vec<PathBuf>,
     projects: Vec<ProjectInfo>,
+    selected_project_index: Option<usize>,
     sessions: Vec<Rc<SessionView>>,
     selected_session_id: Option<u64>,
     zoomed_session_id: Option<u64>,
+    sidebar_visible: bool,
+    last_sidebar_width: i32,
     next_session_id: u64,
 }
 
@@ -68,41 +76,338 @@ struct SessionView {
     alive: Cell<bool>,
 }
 
+struct LaunchButtons {
+    shell_button: Button,
+    codex_button: Button,
+    claude_button: Button,
+    mistral_button: Button,
+    custom_button: Button,
+}
+
+struct SidebarWidgets {
+    project_list: ListBox,
+    project_count_label: Label,
+    refresh_button: Button,
+}
+
+struct WorkspaceWidgets {
+    stack: Stack,
+    grid: Grid,
+    sidebar_toggle_button: Button,
+    workspace_title_label: Label,
+    workspace_path_label: Label,
+    status_label: Label,
+    count_label: Label,
+    launch_buttons: LaunchButtons,
+    close_button: Button,
+    zoom_button: Button,
+    commit_push_button: Button,
+}
+
 fn build_ui(application: &Application) -> Result<()> {
     let cwd = env::current_dir().context("failed to resolve current working directory")?;
-    let (session_file, session_file_path) = load_or_bootstrap(&cwd)?;
+    let (_, session_file_path) = load_or_bootstrap(&cwd)?;
     let project_roots = default_roots();
 
     let window = ApplicationWindow::builder()
         .application(application)
         .title("BelloSaize")
-        .default_width(1680)
+        .default_width(1360)
         .default_height(960)
         .build();
 
-    let root = GtkBox::new(Orientation::Vertical, 16);
-    root.add_css_class("app-root");
-    root.set_margin_top(18);
-    root.set_margin_bottom(18);
-    root.set_margin_start(18);
-    root.set_margin_end(18);
+    let (sidebar, sidebar_widgets) = build_sidebar();
+    let (workspace, workspace_widgets) = build_workspace();
 
-    let hero = build_hero();
-    root.append(&hero);
+    let root = Paned::new(Orientation::Horizontal);
+    root.add_css_class("app-shell");
+    root.set_wide_handle(false);
+    root.set_shrink_start_child(false);
+    root.set_position(260);
+    root.set_start_child(Some(&sidebar));
+    root.set_end_child(Some(&workspace));
 
-    let project_model = gtk::StringList::new(&[]);
-    let project_dropdown = DropDown::builder()
-        .model(&project_model)
+    window.set_child(Some(&root));
+    apply_css();
+
+    let state = Rc::new(RefCell::new(AppState {
+        window: window.clone(),
+        stack: workspace_widgets.stack,
+        grid: workspace_widgets.grid,
+        root_paned: root.clone(),
+        sidebar: sidebar.clone(),
+        sidebar_toggle_button: workspace_widgets.sidebar_toggle_button.clone(),
+        project_list: sidebar_widgets.project_list.clone(),
+        project_count_label: sidebar_widgets.project_count_label,
+        workspace_title_label: workspace_widgets.workspace_title_label,
+        workspace_path_label: workspace_widgets.workspace_path_label,
+        status_label: workspace_widgets.status_label,
+        count_label: workspace_widgets.count_label,
+        close_button: workspace_widgets.close_button.clone(),
+        zoom_button: workspace_widgets.zoom_button.clone(),
+        commit_push_button: workspace_widgets.commit_push_button.clone(),
+        session_file_path,
+        project_roots,
+        projects: Vec::new(),
+        selected_project_index: None,
+        sessions: Vec::new(),
+        selected_session_id: None,
+        zoomed_session_id: None,
+        sidebar_visible: true,
+        last_sidebar_width: 260,
+        next_session_id: 1,
+    }));
+
+    {
+        let state = state.clone();
+        workspace_widgets
+            .launch_buttons
+            .shell_button
+            .connect_clicked(move |_| add_profile_session(&state, Profile::Shell));
+    }
+    {
+        let state = state.clone();
+        workspace_widgets
+            .launch_buttons
+            .codex_button
+            .connect_clicked(move |_| add_profile_session(&state, Profile::Codex));
+    }
+    {
+        let state = state.clone();
+        workspace_widgets
+            .launch_buttons
+            .claude_button
+            .connect_clicked(move |_| add_profile_session(&state, Profile::Claude));
+    }
+    {
+        let state = state.clone();
+        workspace_widgets
+            .launch_buttons
+            .mistral_button
+            .connect_clicked(move |_| add_profile_session(&state, Profile::Mistral));
+    }
+    {
+        let state = state.clone();
+        workspace_widgets
+            .launch_buttons
+            .custom_button
+            .connect_clicked(move |_| prompt_custom_session(&state, None));
+    }
+    {
+        let state = state.clone();
+        sidebar_widgets
+            .refresh_button
+            .connect_clicked(move |_| refresh_projects(&state));
+    }
+    {
+        let state = state.clone();
+        let sidebar_toggle_button = state.borrow().sidebar_toggle_button.clone();
+        sidebar_toggle_button.connect_clicked(move |_| toggle_sidebar(&state));
+    }
+    {
+        let state = state.clone();
+        let root_paned = state.borrow().root_paned.clone();
+        root_paned.connect_position_notify(move |paned| {
+            let position = paned.position();
+            if position > 0 {
+                let mut state_mut = state.borrow_mut();
+                if state_mut.sidebar_visible {
+                    state_mut.last_sidebar_width = position;
+                }
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let close_button = state.borrow().close_button.clone();
+        close_button.connect_clicked(move |_| close_selected_session(&state));
+    }
+    {
+        let state = state.clone();
+        let zoom_button = state.borrow().zoom_button.clone();
+        zoom_button.connect_clicked(move |_| toggle_zoom_selected(&state));
+    }
+    {
+        let state = state.clone();
+        let commit_push_button = state.borrow().commit_push_button.clone();
+        commit_push_button.connect_clicked(move |_| prompt_commit_and_push(&state));
+    }
+    {
+        let state = state.clone();
+        sidebar_widgets
+            .project_list
+            .connect_row_selected(move |_, row| {
+                let selected_index = row.and_then(|row| usize::try_from(row.index()).ok());
+                {
+                    let mut state_mut = state.borrow_mut();
+                    state_mut.selected_project_index =
+                        selected_index.filter(|index| *index < state_mut.projects.len());
+                }
+                update_project_ui(&state);
+                if let Some(project) = selected_project(&state) {
+                    push_status(&state, format!("selected repo: {}", project.path.display()));
+                }
+            });
+    }
+    {
+        let state = state.clone();
+        application.connect_shutdown(move |_| {
+            kill_all_sessions(&state);
+            let _ = persist_sessions(&state);
+        });
+    }
+
+    update_sidebar_button(&state);
+    refresh_projects(&state);
+
+    update_layout(&state);
+    window.present();
+    Ok(())
+}
+
+fn build_sidebar() -> (GtkBox, SidebarWidgets) {
+    let sidebar = GtkBox::new(Orientation::Vertical, 8);
+    sidebar.add_css_class("sidebar");
+    sidebar.set_width_request(250);
+
+    let header = GtkBox::new(Orientation::Vertical, 6);
+    header.add_css_class("sidebar-header");
+
+    let title_row = GtkBox::new(Orientation::Horizontal, 8);
+
+    let title = Label::new(Some("Explorer"));
+    title.add_css_class("sidebar-title");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+
+    let project_count_label = Label::new(Some("0 repos"));
+    project_count_label.add_css_class("count-label");
+
+    let refresh_button = action_button("Refresh");
+    refresh_button.set_tooltip_text(Some("Rescan the configured project roots."));
+
+    title_row.append(&title);
+    title_row.append(&project_count_label);
+
+    let hint = Label::new(Some("Click a repo. Double-click to open a shell."));
+    hint.add_css_class("hint-label");
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+
+    header.append(&title_row);
+    header.append(&refresh_button);
+
+    let project_list = ListBox::new();
+    project_list.add_css_class("project-list");
+    project_list.set_selection_mode(gtk::SelectionMode::Single);
+    project_list.set_vexpand(true);
+
+    let scroller = ScrolledWindow::builder()
         .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&project_list)
         .build();
-    project_dropdown.add_css_class("project-picker");
+    scroller.add_css_class("project-scroller");
 
-    let (toolbar_scroller, buttons) = build_toolbar(&project_dropdown);
-    root.append(&toolbar_scroller);
+    sidebar.append(&header);
+    sidebar.append(&hint);
+    sidebar.append(&scroller);
+
+    (
+        sidebar,
+        SidebarWidgets {
+            project_list,
+            project_count_label,
+            refresh_button,
+        },
+    )
+}
+
+fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
+    let workspace = GtkBox::new(Orientation::Vertical, 8);
+    workspace.add_css_class("workspace");
+    workspace.set_hexpand(true);
+    workspace.set_vexpand(true);
+
+    let header = GtkBox::new(Orientation::Vertical, 8);
+    header.add_css_class("workspace-header");
+
+    let title_row = GtkBox::new(Orientation::Horizontal, 8);
+    let sidebar_toggle_button = action_button("<");
+    sidebar_toggle_button.set_tooltip_text(Some("Collapse or expand the repo sidebar."));
+
+    let meta = GtkBox::new(Orientation::Vertical, 2);
+    meta.set_hexpand(true);
+
+    let workspace_title_label = Label::new(Some("No repository selected"));
+    workspace_title_label.add_css_class("workspace-title");
+    workspace_title_label.set_xalign(0.0);
+
+    let workspace_path_label = Label::new(Some(
+        "Select a repository on the left, then start a terminal session.",
+    ));
+    workspace_path_label.add_css_class("workspace-path");
+    workspace_path_label.set_xalign(0.0);
+    workspace_path_label.set_ellipsize(EllipsizeMode::Middle);
+
+    meta.append(&workspace_title_label);
+    meta.append(&workspace_path_label);
+
+    title_row.append(&sidebar_toggle_button);
+    title_row.append(&meta);
+
+    let toolbar_row = GtkBox::new(Orientation::Horizontal, 8);
+
+    let launch_group = GtkBox::new(Orientation::Horizontal, 8);
+    launch_group.add_css_class("toolbar-group");
+
+    let shell_button = action_button("Shell");
+    shell_button.set_tooltip_text(Some("Open a shell in the selected repository."));
+    let codex_button = action_button("Codex");
+    codex_button.set_tooltip_text(Some("Launch Codex in the selected repository."));
+    let claude_button = action_button("Claude");
+    claude_button.set_tooltip_text(Some("Launch Claude in the selected repository."));
+    let mistral_button = action_button("Mistral");
+    mistral_button.set_tooltip_text(Some("Launch Mistral in the selected repository."));
+    let custom_button = action_button("Custom");
+    custom_button.set_tooltip_text(Some("Launch a custom command in the selected repository."));
+
+    codex_button.set_sensitive(binary_exists("codex"));
+    claude_button.set_sensitive(binary_exists("claude"));
+    mistral_button.set_sensitive(binary_exists("mistral"));
+
+    launch_group.append(&shell_button);
+    launch_group.append(&codex_button);
+    launch_group.append(&claude_button);
+    launch_group.append(&mistral_button);
+    launch_group.append(&custom_button);
+
+    let spacer = GtkBox::new(Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+
+    let pane_group = GtkBox::new(Orientation::Horizontal, 8);
+    pane_group.add_css_class("toolbar-group");
+
+    let zoom_button = action_button("Zoom");
+    let close_button = action_button("Close");
+    let commit_push_button = action_button("Commit+Push");
+    commit_push_button.add_css_class("primary-button");
+
+    pane_group.append(&zoom_button);
+    pane_group.append(&close_button);
+    pane_group.append(&commit_push_button);
+
+    toolbar_row.append(&launch_group);
+    toolbar_row.append(&spacer);
+    toolbar_row.append(&pane_group);
+
+    header.append(&title_row);
+    header.append(&toolbar_row);
 
     let grid = Grid::builder()
-        .column_spacing(14)
-        .row_spacing(14)
+        .column_spacing(8)
+        .row_spacing(8)
         .column_homogeneous(true)
         .row_homogeneous(true)
         .hexpand(true)
@@ -112,222 +417,47 @@ fn build_ui(application: &Application) -> Result<()> {
     let content_scroller = ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
         .child(&grid)
         .build();
+    content_scroller.add_css_class("stage-scroller");
 
     let empty_state = build_empty_state();
     let stack = Stack::builder().hexpand(true).vexpand(true).build();
     stack.add_named(&empty_state, Some("empty"));
     stack.add_named(&content_scroller, Some("grid"));
     stack.set_visible_child_name("empty");
-    root.append(&stack);
+
+    let stage = GtkBox::new(Orientation::Vertical, 0);
+    stage.add_css_class("workspace-stage");
+    stage.set_hexpand(true);
+    stage.set_vexpand(true);
+    stage.append(&stack);
 
     let footer = build_footer();
-    let status_label = footer.0;
-    let count_label = footer.1;
-    root.append(&footer.2);
 
-    window.set_child(Some(&root));
-    apply_css();
-
-    let state = Rc::new(RefCell::new(AppState {
-        window: window.clone(),
-        stack,
-        grid,
-        empty_state,
-        project_dropdown: project_dropdown.clone(),
-        project_model,
-        status_label,
-        count_label,
-        close_button: buttons.close_button.clone(),
-        zoom_button: buttons.zoom_button.clone(),
-        commit_push_button: buttons.commit_push_button.clone(),
-        session_file_path,
-        project_roots,
-        projects: Vec::new(),
-        sessions: Vec::new(),
-        selected_session_id: None,
-        zoomed_session_id: None,
-        next_session_id: 1,
-    }));
-
-    refresh_projects(&state);
-
-    {
-        let state = state.clone();
-        buttons
-            .shell_button
-            .connect_clicked(move |_| add_profile_session(&state, Profile::Shell));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .codex_button
-            .connect_clicked(move |_| add_profile_session(&state, Profile::Codex));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .claude_button
-            .connect_clicked(move |_| add_profile_session(&state, Profile::Claude));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .mistral_button
-            .connect_clicked(move |_| add_profile_session(&state, Profile::Mistral));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .custom_button
-            .connect_clicked(move |_| prompt_custom_session(&state));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .refresh_projects_button
-            .connect_clicked(move |_| refresh_projects(&state));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .close_button
-            .connect_clicked(move |_| close_selected_session(&state));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .zoom_button
-            .connect_clicked(move |_| toggle_zoom_selected(&state));
-    }
-    {
-        let state = state.clone();
-        buttons
-            .commit_push_button
-            .connect_clicked(move |_| prompt_commit_and_push(&state));
-    }
-
-    {
-        let state = state.clone();
-        project_dropdown.connect_selected_notify(move |_| {
-            let project = selected_project_path(&state)
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "current working directory".to_string());
-            push_status(&state, format!("launch target: {project}"));
-        });
-    }
-
-    {
-        let state = state.clone();
-        application.connect_shutdown(move |_| {
-            kill_all_sessions(&state);
-            let _ = persist_sessions(&state);
-        });
-    }
-
-    for spec in session_file.sessions {
-        if let Err(error) = spawn_session(&state, spec) {
-            push_status(&state, format!("failed to restore session: {error}"));
-        }
-    }
-
-    update_layout(&state);
-    window.present();
-    Ok(())
-}
-
-fn build_hero() -> GtkBox {
-    let hero = GtkBox::new(Orientation::Vertical, 8);
-    hero.add_css_class("hero");
-    hero.set_hexpand(true);
-    hero.set_margin_bottom(2);
-
-    let title = Label::new(Some("BelloSaize"));
-    title.add_css_class("hero-title");
-    title.set_xalign(0.0);
-    title.set_margin_bottom(2);
-
-    let subtitle = Label::new(Some(
-        "Native terminal deck for Codex, Claude, Mistral, and shells. Click a pane to focus. Double-click a header to zoom.",
-    ));
-    subtitle.add_css_class("hero-subtitle");
-    subtitle.set_wrap(true);
-    subtitle.set_xalign(0.0);
-
-    hero.append(&title);
-    hero.append(&subtitle);
-    hero
-}
-
-struct ToolbarButtons {
-    shell_button: Button,
-    codex_button: Button,
-    claude_button: Button,
-    mistral_button: Button,
-    custom_button: Button,
-    refresh_projects_button: Button,
-    close_button: Button,
-    zoom_button: Button,
-    commit_push_button: Button,
-}
-
-fn build_toolbar(project_dropdown: &DropDown) -> (ScrolledWindow, ToolbarButtons) {
-    let row = GtkBox::new(Orientation::Horizontal, 10);
-    row.add_css_class("toolbar-row");
-
-    let project_box = GtkBox::new(Orientation::Horizontal, 10);
-    project_box.add_css_class("control-cluster");
-
-    let project_label = Label::new(Some("Project"));
-    project_label.add_css_class("cluster-label");
-    project_box.append(&project_label);
-    project_box.append(project_dropdown);
-
-    let shell_button = large_button("New Shell");
-    let codex_button = large_button("New Codex");
-    let claude_button = large_button("New Claude");
-    let mistral_button = large_button("New Mistral");
-    let custom_button = large_button("Custom...");
-    let refresh_projects_button = large_button("Reload Projects");
-
-    let zoom_button = large_button("Zoom");
-    let close_button = large_button("Close");
-    let commit_push_button = large_button("Commit+Push");
-    commit_push_button.add_css_class("commit-push-action");
-
-    row.append(&project_box);
-    row.append(&shell_button);
-    row.append(&codex_button);
-    row.append(&claude_button);
-    row.append(&mistral_button);
-    row.append(&custom_button);
-    row.append(&refresh_projects_button);
-    row.append(&zoom_button);
-    row.append(&close_button);
-    row.append(&commit_push_button);
-
-    codex_button.set_sensitive(binary_exists("codex"));
-    claude_button.set_sensitive(binary_exists("claude"));
-    mistral_button.set_sensitive(binary_exists("mistral"));
-
-    let scroller = ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .min_content_height(86)
-        .child(&row)
-        .build();
-    scroller.add_css_class("toolbar-scroller");
+    workspace.append(&header);
+    workspace.append(&stage);
+    workspace.append(&footer.2);
 
     (
-        scroller,
-        ToolbarButtons {
-            shell_button,
-            codex_button,
-            claude_button,
-            mistral_button,
-            custom_button,
-            refresh_projects_button,
+        workspace,
+        WorkspaceWidgets {
+            stack,
+            grid,
+            sidebar_toggle_button,
+            workspace_title_label,
+            workspace_path_label,
+            status_label: footer.0,
+            count_label: footer.1,
+            launch_buttons: LaunchButtons {
+                shell_button,
+                codex_button,
+                claude_button,
+                mistral_button,
+                custom_button,
+            },
             close_button,
             zoom_button,
             commit_push_button,
@@ -336,16 +466,16 @@ fn build_toolbar(project_dropdown: &DropDown) -> (ScrolledWindow, ToolbarButtons
 }
 
 fn build_empty_state() -> GtkBox {
-    let box_ = GtkBox::new(Orientation::Vertical, 10);
+    let box_ = GtkBox::new(Orientation::Vertical, 8);
     box_.add_css_class("empty-state");
     box_.set_valign(Align::Center);
     box_.set_halign(Align::Center);
 
-    let title = Label::new(Some("No terminals running yet"));
+    let title = Label::new(Some("No terminals running"));
     title.add_css_class("empty-title");
 
     let body = Label::new(Some(
-        "Pick a project from the toolbar and launch a shell or agent. BelloSaize will tile the panes automatically.",
+        "Select a repository on the left, then use the buttons above to open Shell, Codex, Claude, Mistral, or a custom session.",
     ));
     body.add_css_class("empty-body");
     body.set_wrap(true);
@@ -357,7 +487,7 @@ fn build_empty_state() -> GtkBox {
 }
 
 fn build_footer() -> (Label, Label, GtkBox) {
-    let footer = GtkBox::new(Orientation::Horizontal, 12);
+    let footer = GtkBox::new(Orientation::Horizontal, 8);
     footer.add_css_class("footer");
 
     let status_label = Label::new(Some("Ready."));
@@ -374,18 +504,19 @@ fn build_footer() -> (Label, Label, GtkBox) {
     (status_label, count_label, footer)
 }
 
-fn large_button(label: &str) -> Button {
+fn action_button(label: &str) -> Button {
     let button = Button::with_label(label);
-    button.add_css_class("large-action");
+    button.add_css_class("action-button");
     button
 }
 
 fn refresh_projects(state: &SharedState) {
-    let (previous_path, roots) = {
+    let (previous_path, roots, project_list) = {
         let state = state.borrow();
         (
-            selected_project_path_ref(&state).map(|path| path.to_string_lossy().to_string()),
+            selected_project_ref(&state).map(|project| project.path.to_string_lossy().to_string()),
             state.project_roots.clone(),
+            state.project_list.clone(),
         )
     };
 
@@ -403,33 +534,196 @@ fn refresh_projects(state: &SharedState) {
         }
     }
 
-    let mut state_mut = state.borrow_mut();
-    state_mut.projects = projects;
-    let model = state_mut.project_model.clone();
-    while model.n_items() > 0 {
-        model.remove(0);
-    }
-    for project in &state_mut.projects {
-        model.append(&project.name);
+    while let Some(child) = project_list.first_child() {
+        project_list.remove(&child);
     }
 
-    let selected_index = previous_path
-        .and_then(|path| {
+    let (projects_for_rows, selected_index, project_total) = {
+        let mut state_mut = state.borrow_mut();
+        state_mut.projects = projects;
+        state_mut.selected_project_index = if state_mut.projects.is_empty() {
+            None
+        } else {
+            Some(
+                previous_path
+                    .and_then(|path| {
+                        state_mut
+                            .projects
+                            .iter()
+                            .position(|project| project.path.to_string_lossy() == path)
+                    })
+                    .unwrap_or(0),
+            )
+        };
+
+        (
+            state_mut.projects.clone(),
+            state_mut.selected_project_index,
+            state_mut.projects.len(),
+        )
+    };
+
+    for (index, project) in projects_for_rows.iter().enumerate() {
+        let row = build_project_row(state, index, project);
+        project_list.append(&row);
+    }
+
+    if let Some(index) = selected_index {
+        select_project_row(state, index);
+    } else {
+        update_project_ui(state);
+    }
+
+    push_status(state, format!("loaded {project_total} repositories"));
+}
+
+fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.add_css_class("project-row");
+    row.set_tooltip_text(Some("Double-click to open a shell in this repository."));
+
+    let body = GtkBox::new(Orientation::Vertical, 2);
+    body.add_css_class("project-row-body");
+
+    let name = Label::new(Some(&project.name));
+    name.add_css_class("project-name");
+    name.set_xalign(0.0);
+
+    let path = Label::new(Some(&project.path.display().to_string()));
+    path.add_css_class("project-path");
+    path.set_xalign(0.0);
+    path.set_ellipsize(EllipsizeMode::Middle);
+
+    body.append(&name);
+    body.append(&path);
+
+    let click = gtk::GestureClick::new();
+    {
+        let state = state.clone();
+        click.connect_pressed(move |_, presses, _, _| {
+            if presses == 2 {
+                select_project_row(&state, index);
+                if let Some(project) = project_at_index(&state, index) {
+                    add_profile_session_in_cwd(&state, Profile::Shell, project.path);
+                }
+            }
+        });
+    }
+    body.add_controller(click);
+
+    row.set_child(Some(&body));
+    row
+}
+
+fn update_project_ui(state: &SharedState) {
+    let (
+        project_list,
+        project_count_label,
+        workspace_title_label,
+        workspace_path_label,
+        selected_index,
+        project_total,
+        selected_title,
+        selected_path,
+    ) = {
+        let state = state.borrow();
+        let selected = selected_project_ref(&state);
+        (
+            state.project_list.clone(),
+            state.project_count_label.clone(),
+            state.workspace_title_label.clone(),
+            state.workspace_path_label.clone(),
+            state.selected_project_index,
+            state.projects.len(),
+            selected
+                .map(|project| project.name.clone())
+                .unwrap_or_else(|| "No repository selected".to_string()),
+            selected
+                .map(|project| project.path.display().to_string())
+                .unwrap_or_else(|| {
+                    "Select a repository on the left, then start a terminal session.".to_string()
+                }),
+        )
+    };
+
+    project_count_label.set_text(&format!(
+        "{project_total} {}",
+        if project_total == 1 { "repo" } else { "repos" }
+    ));
+    workspace_title_label.set_text(&selected_title);
+    workspace_path_label.set_text(&selected_path);
+    update_project_row_classes(&project_list, selected_index);
+}
+
+fn update_project_row_classes(project_list: &ListBox, selected_index: Option<usize>) {
+    let mut index = 0;
+    while let Some(row) = project_list.row_at_index(index) {
+        if selected_index == usize::try_from(index).ok() {
+            row.add_css_class("selected-project-row");
+        } else {
+            row.remove_css_class("selected-project-row");
+        }
+        index += 1;
+    }
+}
+
+fn select_project_row(state: &SharedState, index: usize) {
+    let project_list = state.borrow().project_list.clone();
+    if let Some(row) = project_list.row_at_index(index as i32) {
+        project_list.select_row(Some(&row));
+    }
+}
+
+fn toggle_sidebar(state: &SharedState) {
+    let visible = {
+        let mut state_mut = state.borrow_mut();
+        if state_mut.sidebar_visible {
+            let current_position = state_mut.root_paned.position();
+            if current_position > 0 {
+                state_mut.last_sidebar_width = current_position;
+            }
             state_mut
-                .projects
-                .iter()
-                .position(|project| project.path.to_string_lossy() == path)
-        })
-        .unwrap_or(0);
-    state_mut
-        .project_dropdown
-        .set_selected(selected_index as u32);
+                .root_paned
+                .set_start_child(Option::<&GtkBox>::None);
+            state_mut.sidebar_visible = false;
+            false
+        } else {
+            let sidebar = state_mut.sidebar.clone();
+            state_mut.root_paned.set_start_child(Some(&sidebar));
+            state_mut
+                .root_paned
+                .set_position(state_mut.last_sidebar_width.max(180));
+            state_mut.sidebar_visible = true;
+            true
+        }
+    };
+    update_sidebar_button(state);
+    push_status(
+        state,
+        if visible {
+            "sidebar shown".to_string()
+        } else {
+            "sidebar hidden".to_string()
+        },
+    );
+}
+
+fn update_sidebar_button(state: &SharedState) {
+    let (button, visible) = {
+        let state = state.borrow();
+        (state.sidebar_toggle_button.clone(), state.sidebar_visible)
+    };
+    button.set_label(if visible { "<" } else { ">" });
 }
 
 fn add_profile_session(state: &SharedState, profile: Profile) {
     let cwd = selected_project_path(state)
         .or_else(|| env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
+    add_profile_session_in_cwd(state, profile, cwd);
+}
+
+fn add_profile_session_in_cwd(state: &SharedState, profile: Profile, cwd: PathBuf) {
     let spec = SessionSpec {
         cwd,
         command: profile.default_command(),
@@ -447,7 +741,7 @@ fn add_profile_session(state: &SharedState, profile: Profile) {
 }
 
 #[allow(deprecated)]
-fn prompt_custom_session(state: &SharedState) {
+fn prompt_custom_session(state: &SharedState, cwd_override: Option<PathBuf>) {
     let window = state.borrow().window.clone();
     let dialog = gtk::Dialog::builder()
         .title("Custom Terminal")
@@ -479,6 +773,7 @@ fn prompt_custom_session(state: &SharedState) {
         let state = state.clone();
         let title_entry = title_entry.clone();
         let command_entry = command_entry.clone();
+        let cwd_override = cwd_override.clone();
         dialog.connect_response(move |dialog, response| {
             if response == ResponseType::Accept {
                 let command = command_entry.text().trim().to_string();
@@ -489,7 +784,9 @@ fn prompt_custom_session(state: &SharedState) {
                         "Enter a command for the custom terminal.",
                     );
                 } else {
-                    let cwd = selected_project_path(&state)
+                    let cwd = cwd_override
+                        .clone()
+                        .or_else(|| selected_project_path(&state))
                         .or_else(|| env::current_dir().ok())
                         .unwrap_or_else(|| PathBuf::from("."));
                     let name = {
@@ -592,9 +889,11 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
     subtitle_label.add_css_class("session-subtitle");
     subtitle_label.set_xalign(0.0);
     subtitle_label.set_wrap(true);
+    subtitle_label.set_ellipsize(EllipsizeMode::Middle);
 
     let badge_label = Label::new(Some(spec.profile.label()));
     badge_label.add_css_class("profile-badge");
+    badge_label.add_css_class(profile_css_class(spec.profile));
 
     let status_label = Label::new(Some("LIVE"));
     status_label.add_css_class("live-pill");
@@ -603,7 +902,7 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
     meta_box.append(&title_label);
     meta_box.append(&subtitle_label);
 
-    let badge_box = GtkBox::new(Orientation::Horizontal, 8);
+    let badge_box = GtkBox::new(Orientation::Horizontal, 6);
     badge_box.append(&badge_label);
     badge_box.append(&status_label);
 
@@ -712,11 +1011,7 @@ fn launch_terminal_process(state: &SharedState, session: &Rc<SessionView>) -> Re
     let argv = parse_command(&spec.resolved_command())?;
     let argv_strings = argv.clone();
     let workdir = spec.cwd.to_string_lossy().to_string();
-    let envv = vec![
-        "TERM=xterm-256color".to_string(),
-        "COLORTERM=truecolor".to_string(),
-        format!("SHELL={}", crate::persist::default_shell()),
-    ];
+    let envv = spawn_environment();
 
     let terminal = session.terminal.clone();
     let session = session.clone();
@@ -804,7 +1099,6 @@ fn update_layout(state: &SharedState) {
     state_mut.close_button.set_sensitive(focused);
     state_mut.zoom_button.set_sensitive(focused);
     state_mut.commit_push_button.set_sensitive(focused);
-    let _ = &state_mut.empty_state;
 }
 
 fn attach_sessions(grid: &Grid, sessions: &[Rc<SessionView>]) {
@@ -1070,17 +1364,13 @@ fn show_output_dialog(window: &ApplicationWindow, title: &str, body: &str) {
 }
 
 fn persist_sessions(state: &SharedState) -> Result<()> {
-    let (path, sessions) = {
-        let state = state.borrow();
-        let sessions = state
-            .sessions
-            .iter()
-            .map(|session| session.spec.borrow().clone())
-            .collect::<Vec<_>>();
-        (state.session_file_path.clone(), sessions)
-    };
-
-    save(&path, &SessionFile { sessions })
+    let path = state.borrow().session_file_path.clone();
+    save(
+        &path,
+        &SessionFile {
+            sessions: Vec::new(),
+        },
+    )
 }
 
 fn parse_command(command: &str) -> Result<Vec<String>> {
@@ -1094,14 +1384,22 @@ fn parse_command(command: &str) -> Result<Vec<String>> {
 
 fn selected_project_path(state: &SharedState) -> Option<PathBuf> {
     let state = state.borrow();
-    selected_project_path_ref(&state)
+    selected_project_ref(&state).map(|project| project.path.clone())
 }
 
-fn selected_project_path_ref(state: &AppState) -> Option<PathBuf> {
+fn selected_project_ref(state: &AppState) -> Option<&ProjectInfo> {
     state
-        .projects
-        .get(state.project_dropdown.selected() as usize)
-        .map(|project| project.path.clone())
+        .selected_project_index
+        .and_then(|index| state.projects.get(index))
+}
+
+fn selected_project(state: &SharedState) -> Option<ProjectInfo> {
+    let state = state.borrow();
+    selected_project_ref(&state).cloned()
+}
+
+fn project_at_index(state: &SharedState, index: usize) -> Option<ProjectInfo> {
+    state.borrow().projects.get(index).cloned()
 }
 
 fn selected_session(state: &SharedState) -> Option<Rc<SessionView>> {
@@ -1148,15 +1446,55 @@ fn binary_exists(binary: &str) -> bool {
     })
 }
 
+fn profile_css_class(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Shell => "profile-shell",
+        Profile::Codex => "profile-codex",
+        Profile::Claude => "profile-claude",
+        Profile::Mistral => "profile-mistral",
+        Profile::Custom => "profile-custom",
+    }
+}
+
+fn spawn_environment() -> Vec<String> {
+    let mut envv = env::vars().collect::<BTreeMap<_, _>>();
+    envv.extend(login_shell_environment());
+    envv.insert("TERM".to_string(), "xterm-256color".to_string());
+    envv.insert("COLORTERM".to_string(), "truecolor".to_string());
+    envv.insert("SHELL".to_string(), crate::persist::default_shell());
+    envv.into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
+}
+
+fn login_shell_environment() -> BTreeMap<String, String> {
+    let shell = crate::persist::default_shell();
+    let output = Command::new(&shell).args(["-lc", "env -0"]).output();
+
+    let Ok(output) = output else {
+        return BTreeMap::new();
+    };
+
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
 fn apply_terminal_theme(terminal: &Terminal) {
     let font = FontDescription::from_string("JetBrains Mono 11");
     terminal.set_font(Some(&font));
 
-    let foreground = gdk::RGBA::parse("#f7f3e8").unwrap_or_else(|_| gdk::RGBA::BLACK);
-    let background = gdk::RGBA::parse("#111417").unwrap_or_else(|_| gdk::RGBA::WHITE);
+    let foreground = gdk::RGBA::parse("#d4d4d4").unwrap_or_else(|_| gdk::RGBA::BLACK);
+    let background = gdk::RGBA::parse("#1e1e1e").unwrap_or_else(|_| gdk::RGBA::WHITE);
     let palette_values = [
-        "#111417", "#f86542", "#7ecf76", "#f1c76d", "#74a8ff", "#d48dff", "#67d3d7", "#f7f3e8",
-        "#364049", "#ff9774", "#a4e89a", "#f7d998", "#9fc2ff", "#e6b6ff", "#9ce2e6", "#ffffff",
+        "#1e1e1e", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#e5e5e5",
+        "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
     ];
     let palette = palette_values
         .iter()
@@ -1172,162 +1510,207 @@ fn apply_css() {
     let provider = CssProvider::new();
     provider.load_from_string(
         "
-        .app-root {
-            background:
-                radial-gradient(circle at top left, rgba(245, 163, 114, 0.16), transparent 34%),
-                radial-gradient(circle at bottom right, rgba(82, 166, 222, 0.16), transparent 30%),
-                linear-gradient(180deg, #101215 0%, #0b0e10 100%);
+        .app-shell {
+            background: #1e1e1e;
         }
 
-        .hero {
-            padding: 18px 22px 16px 22px;
-            background:
-                linear-gradient(180deg, rgba(247, 243, 232, 0.08), rgba(247, 243, 232, 0.03));
-            border: 1px solid rgba(247, 243, 232, 0.10);
-            border-radius: 24px;
-            box-shadow: 0 16px 48px rgba(0, 0, 0, 0.24);
+        .sidebar {
+            padding: 8px;
+            background: #252526;
+            border-right: 1px solid #2d2d2d;
         }
 
-        .hero-title {
-            font-size: 34px;
-            font-weight: 900;
-            font-family: \"JetBrains Mono\", monospace;
-            color: #fff6e8;
-            letter-spacing: 0.10em;
-        }
-
-        .hero-subtitle {
-            color: rgba(247, 243, 232, 0.78);
-            font-size: 15px;
-        }
-
-        .toolbar-scroller,
-        .footer,
-        .empty-state,
+        .sidebar-header,
+        .workspace-header,
+        .workspace-stage,
         .session-card {
-            background: rgba(20, 24, 28, 0.88);
-            border: 1px solid rgba(247, 243, 232, 0.10);
-            border-radius: 22px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.28);
+            background: #1e1e1e;
+            border: 1px solid #2d2d2d;
+            box-shadow: none;
         }
 
-        .toolbar-row {
-            padding: 12px;
+        .sidebar-header,
+        .workspace-header {
+            padding: 8px;
         }
 
-        .control-cluster {
-            min-width: 300px;
-            padding: 10px 12px;
-            margin-right: 8px;
-            background: rgba(247, 243, 232, 0.05);
-            border-radius: 18px;
-        }
-
-        .cluster-label {
-            font-weight: 700;
-            color: #f7f3e8;
-        }
-
-        .project-picker {
-            min-width: 260px;
-        }
-
-        .large-action {
-            min-height: 46px;
-            padding: 0 16px;
-            font-weight: 700;
-            border-radius: 16px;
-        }
-
-        .large-action:not(:disabled) {
-            background: linear-gradient(180deg, #efe4cf 0%, #d6c2a2 100%);
-            color: #161a1e;
-        }
-
-        .commit-push-action:not(:disabled) {
-            background: linear-gradient(180deg, #ffbe77 0%, #ef7240 100%);
-            color: #121518;
-        }
-
-        .large-action:disabled {
-            opacity: 0.45;
-        }
-
-        .empty-state {
-            padding: 48px;
-        }
-
-        .empty-title {
-            font-size: 30px;
-            font-weight: 800;
-            color: #fff6e8;
-        }
-
-        .empty-body {
+        .sidebar-title,
+        .workspace-title {
+            color: #cccccc;
             font-size: 16px;
-            color: rgba(247, 243, 232, 0.75);
+            font-weight: 700;
         }
 
-        .footer {
-            padding: 12px 16px;
-        }
-
-        .footer-status,
-        .footer-count {
-            color: rgba(247, 243, 232, 0.80);
+        .count-label {
+            color: #9da0a6;
+            font-size: 11px;
             font-weight: 600;
         }
 
-        .session-card {
+        .hint-label,
+        .workspace-path,
+        .project-path,
+        .session-subtitle,
+        .empty-body {
+            color: #9da0a6;
+            font-size: 12px;
+        }
+
+        .action-button {
+            min-height: 32px;
+            padding: 0 12px;
+            border-radius: 3px;
+            border: 1px solid #3c3c3c;
+            background: #2d2d30;
+            color: #cccccc;
+            font-weight: 600;
+            box-shadow: none;
+        }
+
+        .action-button:hover:not(:disabled) {
+            background: #37373d;
+        }
+
+        .action-button:disabled {
+            opacity: 0.45;
+        }
+
+        .primary-button:not(:disabled) {
+            background: #0e639c;
+            border-color: #1177bb;
+            color: #ffffff;
+        }
+
+        .primary-button:hover:not(:disabled) {
+            background: #1177bb;
+        }
+
+        .workspace {
+            padding: 8px;
+            background: #1e1e1e;
+        }
+
+        .workspace-header {
+            padding: 8px;
+        }
+
+        .toolbar-group {
             padding: 0;
         }
 
+        .workspace-stage {
+            background: #1e1e1e;
+        }
+
+        .stage-scroller,
+        .project-scroller,
+        .project-list {
+            background: transparent;
+        }
+
+        .project-row {
+            background: transparent;
+        }
+
+        .project-row-body {
+            padding: 8px 10px;
+            border-radius: 3px;
+            background: transparent;
+            border: 1px solid transparent;
+        }
+
+        .project-row:hover .project-row-body {
+            background: #2a2d2e;
+        }
+
+        .selected-project-row .project-row-body {
+            background: #094771;
+            border-color: #0e639c;
+        }
+
+        .project-name,
+        .empty-title,
+        .session-title {
+            color: #cccccc;
+            font-size: 14px;
+            font-weight: 700;
+        }
+
+        .empty-state {
+            padding: 32px;
+            border: 1px dashed #3c3c3c;
+            background: #1e1e1e;
+        }
+
+        .session-card {
+            background: #1e1e1e;
+        }
+
         .session-header {
-            padding: 14px 16px;
-            background:
-                linear-gradient(180deg, rgba(247, 243, 232, 0.08), rgba(247, 243, 232, 0.02));
-            border-bottom: 1px solid rgba(247, 243, 232, 0.10);
+            padding: 8px 10px;
+            background: #252526;
+            border-bottom: 1px solid #2d2d2d;
         }
 
         .selected-card {
-            border-color: rgba(241, 199, 109, 0.82);
-            box-shadow: 0 0 0 2px rgba(241, 199, 109, 0.16), 0 22px 70px rgba(0, 0, 0, 0.32);
-        }
-
-        .session-title {
-            font-size: 18px;
-            font-weight: 800;
-            color: #fff6e8;
-        }
-
-        .session-subtitle {
-            color: rgba(247, 243, 232, 0.70);
-            font-size: 12px;
+            border-color: #0e639c;
         }
 
         .profile-badge,
         .live-pill,
         .dead-pill {
-            padding: 6px 10px;
-            border-radius: 999px;
-            font-size: 11px;
-            font-weight: 800;
-            letter-spacing: 0.06em;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 700;
         }
 
-        .profile-badge {
-            background: rgba(116, 168, 255, 0.18);
-            color: #c8dcff;
+        .profile-shell {
+            background: #3c3c3c;
+            color: #d4d4d4;
+        }
+
+        .profile-codex {
+            background: #09395c;
+            color: #9cdcfe;
+        }
+
+        .profile-claude {
+            background: #4d3419;
+            color: #ffd7a8;
+        }
+
+        .profile-mistral {
+            background: #183d2e;
+            color: #b5f4d4;
+        }
+
+        .profile-custom {
+            background: #3a2b52;
+            color: #d9c5ff;
         }
 
         .live-pill {
-            background: rgba(126, 207, 118, 0.18);
-            color: #cbffbe;
+            background: #183d2e;
+            color: #b5f4d4;
         }
 
         .dead-pill {
-            background: rgba(248, 101, 66, 0.20);
-            color: #ffd0c3;
+            background: #4d1f24;
+            color: #f2b8bd;
+        }
+
+        .footer {
+            padding: 4px 8px;
+            background: #181818;
+            border: 1px solid #2d2d2d;
+        }
+
+        .footer-status,
+        .footer-count {
+            color: #cccccc;
+            font-size: 12px;
+            font-weight: 600;
         }
         ",
     );

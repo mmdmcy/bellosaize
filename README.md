@@ -6,10 +6,9 @@ It is built for the workflow where the heavy work already happens inside the age
 
 - real embedded terminals via GTK4 + VTE
 - automatic tiling for 1, 2, 3, 4, and larger pane counts
-- project-aware launcher for repositories under your usual code roots
+- VS Code-inspired workspace shell with a collapsible repo explorer
 - click-to-focus panes, double-click-to-zoom headers
 - focused-pane `Commit+Push` flow with one prompt
-- session persistence in `~/.config/bellosaize/session.toml`
 
 This is a normal desktop app. It does not run a browser UI, it does not need `localhost`, and it does not depend on Electron.
 
@@ -22,6 +21,16 @@ Running several AI coding agents at once gets messy fast:
 - switching between sessions takes more mental overhead than it should
 
 BelloSaize keeps those sessions inside one native window, shows the project for each pane, and gives you one place to launch and manage them.
+
+## Interface
+
+The current layout is built around three pieces:
+
+- a left repository explorer sidebar that can be resized with the splitter and collapsed from the header
+- a clear top action row with `Shell`, `Codex`, `Claude`, `Mistral`, and `Custom`
+- a centered terminal stage that tiles panes more like a lightweight tiling window manager than a traditional IDE tab strip
+
+The styling is intentionally flat and lightweight: darker editor-style surfaces, thin borders, and minimal visual effects.
 
 ## Current Behavior
 
@@ -71,16 +80,18 @@ cargo build --release
 
 ## Use
 
-1. Pick a repository from the `Project` dropdown.
-2. Launch a pane with `New Shell`, `New Codex`, `New Claude`, `New Mistral`, or `Custom...`.
-3. Click any pane to focus it.
-4. Double-click a pane header to zoom or unzoom it.
-5. Use `Commit+Push` on the focused pane when you want to stage, commit, and push from that repository.
+1. Select a repository from the left explorer.
+2. Launch a pane from the top action row with `Shell`, `Codex`, `Claude`, `Mistral`, or `Custom`.
+3. Double-click a repository row if you want the fastest path to a shell in that folder.
+4. Click any pane to focus it.
+5. Double-click a pane header to zoom or unzoom it.
+6. Use the sidebar toggle if you want more room for terminals.
+7. Use `Commit+Push` on the focused pane when you want to stage, commit, and push from that repository.
 
 Notes:
 
 - If VTE reports a new current directory because you `cd` inside a shell, BelloSaize tracks that and uses it for git actions.
-- Closing the app stops the child processes and saves the pane specs so the next launch can restore the layout.
+- Closing the app stops the child processes. BelloSaize does not auto-restore terminals on the next launch.
 
 ## Project Discovery
 
@@ -104,21 +115,6 @@ If nothing is found, it falls back to the current working directory.
 If the current branch has no upstream yet, BelloSaize falls back to `git push -u origin <branch>`.
 
 Output is shown in a dialog instead of being injected into the running terminal process.
-
-## Persistence
-
-Open pane specs are saved to:
-
-```text
-~/.config/bellosaize/session.toml
-```
-
-That file stores:
-
-- project path
-- command
-- optional pane name
-- launcher profile
 
 ## Status
 
