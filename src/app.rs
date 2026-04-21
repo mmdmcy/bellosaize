@@ -19,7 +19,7 @@ use vte::{CursorBlinkMode, PtyFlags, Terminal, prelude::*};
 
 use crate::{
     persist::{Profile, SessionFile, SessionSpec, load_or_bootstrap, save},
-    project::{ProjectInfo, default_roots, discover_projects},
+    project::{ProjectInfo, default_roots, discover_projects, inspect_project},
 };
 
 const APP_ID: &str = "com.mmdmcy.BelloSaize";
@@ -48,6 +48,7 @@ struct AppState {
     project_count_label: Label,
     workspace_title_label: Label,
     workspace_path_label: Label,
+    workspace_repo_status_label: Label,
     status_label: Label,
     count_label: Label,
     close_button: Button,
@@ -76,6 +77,13 @@ struct SessionView {
     alive: Cell<bool>,
 }
 
+#[derive(Default)]
+struct TerminalClickState {
+    press_x: Cell<f64>,
+    press_y: Cell<f64>,
+    clear_selection_on_release: Cell<bool>,
+}
+
 struct LaunchButtons {
     shell_button: Button,
     codex_button: Button,
@@ -96,6 +104,7 @@ struct WorkspaceWidgets {
     sidebar_toggle_button: Button,
     workspace_title_label: Label,
     workspace_path_label: Label,
+    workspace_repo_status_label: Label,
     status_label: Label,
     count_label: Label,
     launch_buttons: LaunchButtons,
@@ -141,6 +150,7 @@ fn build_ui(application: &Application) -> Result<()> {
         project_count_label: sidebar_widgets.project_count_label,
         workspace_title_label: workspace_widgets.workspace_title_label,
         workspace_path_label: workspace_widgets.workspace_path_label,
+        workspace_repo_status_label: workspace_widgets.workspace_repo_status_label,
         status_label: workspace_widgets.status_label,
         count_label: workspace_widgets.count_label,
         close_button: workspace_widgets.close_button.clone(),
@@ -351,8 +361,15 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
     workspace_path_label.set_xalign(0.0);
     workspace_path_label.set_ellipsize(EllipsizeMode::Middle);
 
+    let workspace_repo_status_label =
+        Label::new(Some("Select a repository to inspect its git state."));
+    workspace_repo_status_label.add_css_class("workspace-repo-status");
+    workspace_repo_status_label.set_xalign(0.0);
+    workspace_repo_status_label.set_wrap(true);
+
     meta.append(&workspace_title_label);
     meta.append(&workspace_path_label);
+    meta.append(&workspace_repo_status_label);
 
     title_row.append(&sidebar_toggle_button);
     title_row.append(&meta);
@@ -449,6 +466,7 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
             sidebar_toggle_button,
             workspace_title_label,
             workspace_path_label,
+            workspace_repo_status_label,
             status_label: footer.0,
             count_label: footer.1,
             launch_buttons: LaunchButtons {
@@ -529,16 +547,23 @@ fn refresh_projects(state: &SharedState) {
                     .and_then(|part| part.to_str())
                     .unwrap_or("current")
                     .to_string(),
+                repo_status: inspect_project(&cwd),
                 path: cwd,
             });
         }
+    }
+
+    for project in &mut projects {
+        project.repo_status = inspect_project(&project.path);
     }
 
     while let Some(child) = project_list.first_child() {
         project_list.remove(&child);
     }
 
-    let (projects_for_rows, selected_index, project_total) = {
+    let refresh_summary = describe_project_overview(&projects);
+
+    let (projects_for_rows, selected_index) = {
         let mut state_mut = state.borrow_mut();
         state_mut.projects = projects;
         state_mut.selected_project_index = if state_mut.projects.is_empty() {
@@ -556,11 +581,7 @@ fn refresh_projects(state: &SharedState) {
             )
         };
 
-        (
-            state_mut.projects.clone(),
-            state_mut.selected_project_index,
-            state_mut.projects.len(),
-        )
+        (state_mut.projects.clone(), state_mut.selected_project_index)
     };
 
     for (index, project) in projects_for_rows.iter().enumerate() {
@@ -574,27 +595,43 @@ fn refresh_projects(state: &SharedState) {
         update_project_ui(state);
     }
 
-    push_status(state, format!("loaded {project_total} repositories"));
+    push_status(state, refresh_summary);
 }
 
 fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class("project-row");
-    row.set_tooltip_text(Some("Double-click to open a shell in this repository."));
+    row.set_tooltip_text(Some(&format!(
+        "{}\nGit: {}",
+        project.path.display(),
+        project.repo_status.short_label()
+    )));
 
     let body = GtkBox::new(Orientation::Vertical, 2);
     body.add_css_class("project-row-body");
 
+    let title_row = GtkBox::new(Orientation::Horizontal, 8);
+
     let name = Label::new(Some(&project.name));
     name.add_css_class("project-name");
     name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.set_ellipsize(EllipsizeMode::End);
+
+    let repo_status = Label::new(Some(&project.repo_status.short_label()));
+    repo_status.add_css_class("repo-status-label");
+    repo_status.add_css_class(project.repo_status.css_class());
+    repo_status.set_xalign(1.0);
+
+    title_row.append(&name);
+    title_row.append(&repo_status);
 
     let path = Label::new(Some(&project.path.display().to_string()));
     path.add_css_class("project-path");
     path.set_xalign(0.0);
     path.set_ellipsize(EllipsizeMode::Middle);
 
-    body.append(&name);
+    body.append(&title_row);
     body.append(&path);
 
     let click = gtk::GestureClick::new();
@@ -621,10 +658,12 @@ fn update_project_ui(state: &SharedState) {
         project_count_label,
         workspace_title_label,
         workspace_path_label,
+        workspace_repo_status_label,
         selected_index,
         project_total,
         selected_title,
         selected_path,
+        selected_status,
     ) = {
         let state = state.borrow();
         let selected = selected_project_ref(&state);
@@ -633,6 +672,7 @@ fn update_project_ui(state: &SharedState) {
             state.project_count_label.clone(),
             state.workspace_title_label.clone(),
             state.workspace_path_label.clone(),
+            state.workspace_repo_status_label.clone(),
             state.selected_project_index,
             state.projects.len(),
             selected
@@ -643,6 +683,9 @@ fn update_project_ui(state: &SharedState) {
                 .unwrap_or_else(|| {
                     "Select a repository on the left, then start a terminal session.".to_string()
                 }),
+            selected
+                .map(|project| format!("Git: {}", project.repo_status.short_label()))
+                .unwrap_or_else(|| "Select a repository to inspect its git state.".to_string()),
         )
     };
 
@@ -652,7 +695,51 @@ fn update_project_ui(state: &SharedState) {
     ));
     workspace_title_label.set_text(&selected_title);
     workspace_path_label.set_text(&selected_path);
+    workspace_repo_status_label.set_text(&selected_status);
     update_project_row_classes(&project_list, selected_index);
+}
+
+fn describe_project_overview(projects: &[ProjectInfo]) -> String {
+    let dirty = projects
+        .iter()
+        .filter(|project| project.repo_status.dirty)
+        .count();
+    let behind = projects
+        .iter()
+        .filter(|project| project.repo_status.behind > 0)
+        .count();
+    let ahead = projects
+        .iter()
+        .filter(|project| project.repo_status.ahead > 0)
+        .count();
+    let attention = projects
+        .iter()
+        .filter(|project| project.repo_status.needs_attention())
+        .count();
+
+    let mut parts = Vec::new();
+    if dirty > 0 {
+        parts.push(format!("{dirty} dirty"));
+    }
+    if behind > 0 {
+        parts.push(format!("{behind} behind"));
+    }
+    if ahead > 0 {
+        parts.push(format!("{ahead} ahead"));
+    }
+    if attention > 0 && parts.is_empty() {
+        parts.push(format!("{attention} need attention"));
+    }
+
+    if parts.is_empty() {
+        format!("loaded {} repositories", projects.len())
+    } else {
+        format!(
+            "loaded {} repositories ({})",
+            projects.len(),
+            parts.join(", ")
+        )
+    }
 }
 
 fn update_project_row_classes(project_list: &ListBox, selected_index: Option<usize>) {
@@ -738,6 +825,65 @@ fn add_profile_session_in_cwd(state: &SharedState, profile: Profile, cwd: PathBu
             &format!("{error:#}"),
         );
     }
+}
+
+fn install_terminal_interactions(state: &SharedState, session: &Rc<SessionView>) {
+    let click_state = Rc::new(TerminalClickState::default());
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    {
+        let state = state.clone();
+        let session = session.clone();
+        let click_state = click_state.clone();
+        click.connect_pressed(move |_, presses, x, y| {
+            if presses != 1 {
+                click_state.clear_selection_on_release.set(false);
+                return;
+            }
+
+            click_state.press_x.set(x);
+            click_state.press_y.set(y);
+            click_state
+                .clear_selection_on_release
+                .set(!session.terminal.has_focus());
+
+            select_session(&state, session.id);
+            session.terminal.grab_focus();
+        });
+    }
+
+    {
+        let session = session.clone();
+        let click_state = click_state.clone();
+        click.connect_released(move |_, presses, x, y| {
+            if presses != 1 {
+                click_state.clear_selection_on_release.set(false);
+                return;
+            }
+
+            let should_clear = click_state.clear_selection_on_release.replace(false);
+            if !should_clear {
+                return;
+            }
+
+            let dx = x - click_state.press_x.get();
+            let dy = y - click_state.press_y.get();
+            if dx.hypot(dy) <= 4.0 {
+                session.terminal.unselect_all();
+            }
+        });
+    }
+
+    session.terminal.add_controller(click);
+}
+
+fn focus_session_terminal(session: &Rc<SessionView>) {
+    let terminal = session.terminal.clone();
+    glib::idle_add_local_once(move || {
+        terminal.grab_focus();
+    });
 }
 
 #[allow(deprecated)]
@@ -873,6 +1019,9 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
     terminal.set_hexpand(true);
     terminal.set_vexpand(true);
     terminal.set_cursor_blink_mode(CursorBlinkMode::On);
+    terminal.set_focus_on_click(true);
+    terminal.set_focusable(true);
+    terminal.set_input_enabled(true);
     terminal.set_scrollback_lines(20_000);
     terminal.set_mouse_autohide(true);
     terminal.set_size_request(360, 220);
@@ -939,6 +1088,8 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
     }
     header.add_controller(click);
 
+    install_terminal_interactions(state, &session);
+
     {
         let state = state.clone();
         let session = session.clone();
@@ -994,6 +1145,7 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
 
     persist_sessions(state)?;
     update_layout(state);
+    focus_session_terminal(&session);
     launch_terminal_process(state, &session)?;
     push_status(
         state,
@@ -1182,6 +1334,9 @@ fn close_selected_session(state: &SharedState) {
         );
     }
     update_layout(state);
+    if let Some(session) = selected_session(state) {
+        focus_session_terminal(&session);
+    }
     push_status(state, format!("closed {}", removed.spec.borrow().title()));
 }
 
@@ -1588,6 +1743,7 @@ fn apply_css() {
 
         .hint-label,
         .workspace-path,
+        .workspace-repo-status,
         .project-path,
         .session-subtitle,
         .empty-body {
@@ -1673,6 +1829,33 @@ fn apply_css() {
             color: #cccccc;
             font-size: 14px;
             font-weight: 700;
+        }
+
+        .repo-status-label {
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 10px;
+            font-weight: 700;
+        }
+
+        .repo-state-ok {
+            background: #183d2e;
+            color: #b5f4d4;
+        }
+
+        .repo-state-warn {
+            background: #4d3419;
+            color: #ffd7a8;
+        }
+
+        .repo-state-alert {
+            background: #4d1f24;
+            color: #f2b8bd;
+        }
+
+        .repo-state-muted {
+            background: #303030;
+            color: #b7b7b7;
         }
 
         .empty-state {

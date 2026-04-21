@@ -27,6 +27,7 @@ BelloSaize keeps those sessions inside one native window, shows the project for 
 The current layout is built around three pieces:
 
 - a left repository explorer sidebar that can be resized with the splitter and collapsed from the header
+- per-repository Git state in the explorer, including up-to-date, dirty, ahead, and behind summaries
 - a clear top action row with `Shell`, `Codex`, `Claude`, `Mistral`, and `Custom`
 - a centered terminal stage that tiles panes more like a lightweight tiling window manager than a traditional IDE tab strip
 
@@ -91,6 +92,7 @@ cargo build --release
 Notes:
 
 - If VTE reports a new current directory because you `cd` inside a shell, BelloSaize tracks that and uses it for git actions.
+- New panes grab keyboard focus immediately, and a plain click on another pane focuses it without leaving behind accidental text selection.
 - Closing the app stops the child processes. BelloSaize does not auto-restore terminals on the next launch.
 
 ## Project Discovery
@@ -105,6 +107,12 @@ BelloSaize scans a few common roots and fills the project picker from Git reposi
 If nothing is found, it falls back to the current working directory.
 
 ## Git Integration
+
+The explorer refresh checks each repository for:
+
+- local dirtiness
+- ahead / behind tracking state against its remote
+- missing upstream or remote-check failures
 
 `Commit+Push` runs host-side git commands in the focused pane's tracked directory:
 
