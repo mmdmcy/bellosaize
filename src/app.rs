@@ -130,6 +130,7 @@ struct AppState {
     sidebar_toggle_button: Button,
     project_list: ListBox,
     project_count_label: Label,
+    refresh_button: Button,
     workspace_title_label: Label,
     workspace_path_label: Label,
     workspace_repo_status_label: Label,
@@ -153,6 +154,7 @@ struct AppState {
     last_sidebar_width: i32,
     next_session_id: u64,
     repo_action_busy: bool,
+    refresh_busy: bool,
 }
 
 struct SessionView {
@@ -241,6 +243,7 @@ fn build_ui(application: &Application) -> Result<()> {
         sidebar_toggle_button: workspace_widgets.sidebar_toggle_button.clone(),
         project_list: sidebar_widgets.project_list.clone(),
         project_count_label: sidebar_widgets.project_count_label,
+        refresh_button: sidebar_widgets.refresh_button.clone(),
         workspace_title_label: workspace_widgets.workspace_title_label,
         workspace_path_label: workspace_widgets.workspace_path_label,
         workspace_repo_status_label: workspace_widgets.workspace_repo_status_label,
@@ -264,6 +267,7 @@ fn build_ui(application: &Application) -> Result<()> {
         last_sidebar_width: 260,
         next_session_id: 1,
         repo_action_busy: false,
+        refresh_busy: false,
     }));
 
     {
@@ -669,15 +673,62 @@ fn action_button(label: &str) -> Button {
 }
 
 fn refresh_projects(state: &SharedState) {
-    let (previous_path, roots) = {
+    let (previous_path, roots, busy) = {
         let state = state.borrow();
         (
             selected_project_ref(&state).map(|project| project.path.to_string_lossy().to_string()),
             state.project_roots.clone(),
+            state.refresh_busy || state.repo_action_busy,
         )
     };
+    if busy {
+        return;
+    }
 
-    let mut projects = discover_projects(&roots);
+    set_refresh_busy(state, true);
+    let spinner_id = start_status_spinner(
+        state,
+        "Refreshing repositories".to_string(),
+        Some(format_project_roots(&roots)),
+    );
+
+    let job = gio::spawn_blocking(move || load_projects(&roots));
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        match job.await {
+            Ok(projects) => {
+                let refresh_summary = describe_project_overview(&projects);
+                {
+                    let mut state_mut = state.borrow_mut();
+                    state_mut.projects = projects;
+                    state_mut.selected_project_index = previous_path.and_then(|path| {
+                        state_mut
+                            .projects
+                            .iter()
+                            .position(|project| project.path.to_string_lossy() == path)
+                    });
+                }
+
+                spinner_id.remove();
+                set_refresh_busy(&state, false);
+                rebuild_project_list(&state);
+                push_status(&state, refresh_summary);
+            }
+            Err(_) => {
+                spinner_id.remove();
+                set_refresh_busy(&state, false);
+                push_status_with_details(
+                    &state,
+                    "Refresh failed".to_string(),
+                    Some("Background refresh task panicked.".to_string()),
+                );
+            }
+        }
+    });
+}
+
+fn load_projects(roots: &[PathBuf]) -> Vec<ProjectInfo> {
+    let mut projects = discover_projects(roots);
     if projects.is_empty() {
         if let Ok(cwd) = env::current_dir() {
             projects.push(ProjectInfo {
@@ -686,7 +737,7 @@ fn refresh_projects(state: &SharedState) {
                     .and_then(|part| part.to_str())
                     .unwrap_or("current")
                     .to_string(),
-                repo_status: inspect_project(&cwd),
+                repo_status: RepoStatus::default(),
                 path: cwd,
             });
         }
@@ -696,21 +747,16 @@ fn refresh_projects(state: &SharedState) {
         project.repo_status = inspect_project(&project.path);
     }
 
-    let refresh_summary = describe_project_overview(&projects);
+    projects
+}
 
-    {
-        let mut state_mut = state.borrow_mut();
-        state_mut.projects = projects;
-        state_mut.selected_project_index = previous_path.and_then(|path| {
-            state_mut
-                .projects
-                .iter()
-                .position(|project| project.path.to_string_lossy() == path)
-        });
-    }
-
-    rebuild_project_list(state);
-    push_status(state, refresh_summary);
+fn format_project_roots(roots: &[PathBuf]) -> String {
+    let body = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Scanning configured roots:\n{body}")
 }
 
 fn rebuild_project_list(state: &SharedState) {
@@ -800,6 +846,8 @@ fn update_project_ui(state: &SharedState) {
     let (
         project_list,
         project_count_label,
+        refresh_button,
+        repo_scope_combo,
         workspace_title_label,
         workspace_path_label,
         workspace_repo_status_label,
@@ -810,6 +858,7 @@ fn update_project_ui(state: &SharedState) {
         project_total,
         action_target_count,
         repo_action_busy,
+        refresh_busy,
         commit_push_enabled,
         selected_title,
         selected_path,
@@ -820,6 +869,8 @@ fn update_project_ui(state: &SharedState) {
         (
             state.project_list.clone(),
             state.project_count_label.clone(),
+            state.refresh_button.clone(),
+            state.repo_scope_combo.clone(),
             state.workspace_title_label.clone(),
             state.workspace_path_label.clone(),
             state.workspace_repo_status_label.clone(),
@@ -830,6 +881,7 @@ fn update_project_ui(state: &SharedState) {
             state.projects.len(),
             repo_action_targets_from_state(&state).len(),
             state.repo_action_busy,
+            state.refresh_busy,
             commit_push_mode_from_state(&state).is_some(),
             selected
                 .map(|project| project.name.clone())
@@ -844,14 +896,28 @@ fn update_project_ui(state: &SharedState) {
                 .unwrap_or_else(|| "Select a repository to inspect its git state.".to_string()),
         )
     };
+    let app_busy = repo_action_busy || refresh_busy;
 
     project_count_label.set_text(&describe_project_count(project_total));
+    refresh_button.set_label(if refresh_busy {
+        "Refreshing..."
+    } else {
+        "Refresh"
+    });
+    if refresh_busy {
+        refresh_button.add_css_class("busy-button");
+    } else {
+        refresh_button.remove_css_class("busy-button");
+    }
+    refresh_button.set_sensitive(!app_busy);
+    project_list.set_sensitive(!app_busy);
+    repo_scope_combo.set_sensitive(!app_busy);
     workspace_title_label.set_text(&selected_title);
     workspace_path_label.set_text(&selected_path);
     workspace_repo_status_label.set_text(&selected_status);
-    fetch_button.set_sensitive(!repo_action_busy && action_target_count > 0);
-    pull_button.set_sensitive(!repo_action_busy && action_target_count > 0);
-    commit_push_button.set_sensitive(!repo_action_busy && commit_push_enabled);
+    fetch_button.set_sensitive(!app_busy && action_target_count > 0);
+    pull_button.set_sensitive(!app_busy && action_target_count > 0);
+    commit_push_button.set_sensitive(!app_busy && commit_push_enabled);
     update_project_row_classes(&project_list, selected_index);
 }
 
@@ -963,14 +1029,6 @@ fn repo_action_targets_from_state(state: &AppState) -> Vec<ProjectInfo> {
         RepoActionScope::Selected => selected_project_ref(state).cloned().into_iter().collect(),
         RepoActionScope::All => state.projects.clone(),
     }
-}
-
-fn repo_action_targets(state: &SharedState) -> (RepoActionScope, Vec<ProjectInfo>) {
-    let state = state.borrow();
-    (
-        current_repo_action_scope(&state),
-        repo_action_targets_from_state(&state),
-    )
 }
 
 fn toggle_sidebar(state: &SharedState) {
@@ -1181,7 +1239,10 @@ fn prompt_custom_session(state: &SharedState, cwd_override: Option<PathBuf>) {
 
 #[allow(deprecated)]
 fn prompt_commit_and_push(state: &SharedState) {
-    if state.borrow().repo_action_busy {
+    if {
+        let state = state.borrow();
+        state.repo_action_busy || state.refresh_busy
+    } {
         return;
     }
 
@@ -1518,9 +1579,6 @@ fn update_layout(state: &SharedState) {
     state_mut.reset_button.set_sensitive(focused);
     state_mut.close_button.set_sensitive(focused);
     state_mut.zoom_button.set_sensitive(focused);
-    state_mut
-        .commit_push_button
-        .set_sensitive(commit_push_mode_from_state(&state_mut).is_some());
 }
 
 fn attach_sessions(grid: &Grid, sessions: &[Rc<SessionView>]) {
@@ -1686,6 +1744,13 @@ fn run_commit_and_push(
     mode: CommitPushMode,
     message: Option<String>,
 ) {
+    if {
+        let state = state.borrow();
+        state.repo_action_busy || state.refresh_busy
+    } {
+        return;
+    }
+
     set_repo_action_busy(state, true);
 
     let pending_message = match mode {
@@ -1703,49 +1768,112 @@ fn run_commit_and_push(
 
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
-        let result = match job.await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("background git task panicked")),
-        };
-
+        let result = job.await;
         spinner_id.remove();
-        refresh_project_status_for_cwd(&state, &target.cwd);
-        set_repo_action_busy(&state, false);
-
         match result {
-            Ok(output) => push_status_with_details(
-                &state,
-                format!("{} finished for {}", mode.report_title(), target.title),
-                Some(format!("Path: {}\n\n{}", target.cwd.display(), output)),
-            ),
-            Err(error) => push_status_with_details(
-                &state,
-                format!("{} failed for {}", mode.report_title(), target.title),
-                Some(format!("Path: {}\n\n{error:#}", target.cwd.display())),
-            ),
+            Ok((result, repo_status)) => {
+                apply_repo_status_for_cwd(&state, &target.cwd, repo_status);
+                set_repo_action_busy(&state, false);
+
+                match result {
+                    Ok(output) => push_status_with_details(
+                        &state,
+                        format!("{} finished for {}", mode.report_title(), target.title),
+                        Some(format!("Path: {}\n\n{}", target.cwd.display(), output)),
+                    ),
+                    Err(error) => push_status_with_details(
+                        &state,
+                        format!("{} failed for {}", mode.report_title(), target.title),
+                        Some(format!("Path: {}\n\n{error:#}", target.cwd.display())),
+                    ),
+                }
+            }
+            Err(_) => {
+                set_repo_action_busy(&state, false);
+                push_status_with_details(
+                    &state,
+                    format!("{} failed for {}", mode.report_title(), target.title),
+                    Some(format!(
+                        "Path: {}\n\nBackground git task panicked.",
+                        target.cwd.display()
+                    )),
+                );
+            }
         }
     });
 }
 
 fn run_repo_action_for_scope(state: &SharedState, action: RepoAction) {
-    let (scope, targets) = repo_action_targets(state);
-    if targets.is_empty() {
+    let (scope, targets, busy) = {
+        let state = state.borrow();
+        (
+            current_repo_action_scope(&state),
+            repo_action_targets_from_state(&state),
+            state.repo_action_busy || state.refresh_busy,
+        )
+    };
+    if busy || targets.is_empty() {
         return;
     }
 
-    let reports = targets
-        .iter()
-        .map(|project| execute_repo_action(action, project))
-        .collect::<Vec<_>>();
+    set_repo_action_busy(state, true);
+    let spinner_id = start_status_spinner(
+        state,
+        format!(
+            "{} {}",
+            action.label(),
+            describe_repo_scope_target_count(scope, targets.len())
+        ),
+        Some(format_repo_action_targets(&targets)),
+    );
 
-    apply_repo_action_reports(state, &reports);
+    let job = gio::spawn_blocking(move || {
+        targets
+            .into_iter()
+            .map(|project| execute_repo_action(action, &project))
+            .collect::<Vec<_>>()
+    });
 
-    let summary = summarize_repo_action(action, scope, &reports);
-    let details = render_repo_action_report(action, &reports);
-    push_status_with_details(state, summary, Some(details));
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let result = job.await;
+        spinner_id.remove();
+        match result {
+            Ok(reports) => {
+                apply_repo_action_reports(&state, &reports);
+                set_repo_action_busy(&state, false);
+
+                let summary = summarize_repo_action(action, scope, &reports);
+                let details = render_repo_action_report(action, &reports);
+                push_status_with_details(&state, summary, Some(details));
+            }
+            Err(_) => {
+                set_repo_action_busy(&state, false);
+                push_status_with_details(
+                    &state,
+                    format!("{} failed", action.label()),
+                    Some("Background git task panicked.".to_string()),
+                );
+            }
+        }
+    });
 }
 
-fn execute_commit_and_push(cwd: &Path, message: Option<&str>) -> Result<String> {
+fn format_repo_action_targets(targets: &[ProjectInfo]) -> String {
+    targets
+        .iter()
+        .map(|project| format!("{}: {}", project.name, project.path.display()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn execute_commit_and_push(cwd: &Path, message: Option<&str>) -> (Result<String>, RepoStatus) {
+    let result = execute_commit_and_push_inner(cwd, message);
+    let repo_status = inspect_project(cwd);
+    (result, repo_status)
+}
+
+fn execute_commit_and_push_inner(cwd: &Path, message: Option<&str>) -> Result<String> {
     let mut transcript = Vec::new();
 
     if let Some(message) = message {
@@ -2233,7 +2361,7 @@ fn path_is_within_repo(path: &Path, repo_root: &Path) -> bool {
     path == repo_root || path.starts_with(repo_root)
 }
 
-fn refresh_project_status_for_cwd(state: &SharedState, cwd: &Path) {
+fn apply_repo_status_for_cwd(state: &SharedState, cwd: &Path, repo_status: RepoStatus) {
     let repo_path = {
         let state_ref = state.borrow();
         state_ref
@@ -2247,7 +2375,6 @@ fn refresh_project_status_for_cwd(state: &SharedState, cwd: &Path) {
         return;
     };
 
-    let refreshed_status = inspect_project(&repo_path);
     {
         let mut state_mut = state.borrow_mut();
         if let Some(project) = state_mut
@@ -2255,7 +2382,7 @@ fn refresh_project_status_for_cwd(state: &SharedState, cwd: &Path) {
             .iter_mut()
             .find(|project| project.path == repo_path)
         {
-            project.repo_status = refreshed_status;
+            project.repo_status = repo_status;
         }
     }
 
@@ -2271,6 +2398,11 @@ fn next_session_id(state: &SharedState) -> u64 {
 
 fn set_repo_action_busy(state: &SharedState, busy: bool) {
     state.borrow_mut().repo_action_busy = busy;
+    update_project_ui(state);
+}
+
+fn set_refresh_busy(state: &SharedState, busy: bool) {
+    state.borrow_mut().refresh_busy = busy;
     update_project_ui(state);
 }
 
@@ -2481,6 +2613,13 @@ fn apply_css() {
 
         .action-button:disabled {
             opacity: 0.45;
+        }
+
+        .busy-button:disabled {
+            opacity: 1;
+            background: #094771;
+            border-color: #0e639c;
+            color: #ffffff;
         }
 
         .primary-button:not(:disabled) {
