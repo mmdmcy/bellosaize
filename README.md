@@ -8,7 +8,8 @@ It is built for the workflow where the heavy work already happens inside the age
 - automatic tiling for 1, 2, 3, 4, and larger pane counts
 - VS Code-inspired workspace shell with a collapsible repo explorer
 - click-to-focus panes, double-click-to-zoom headers
-- focused-pane `Commit+Push` flow with one prompt
+- separate repo-scoped `Fetch` and `Pull` actions with batch targeting
+- selected-repo `Commit+Push` flow that also handles push-only repos
 
 This is a normal desktop app. It does not run a browser UI, it does not need `localhost`, and it does not depend on Electron.
 
@@ -28,7 +29,9 @@ The current layout is built around three pieces:
 
 - a left repository explorer sidebar that can be resized with the splitter and collapsed from the header
 - per-repository Git state in the explorer, including up-to-date, dirty, ahead, and behind summaries
+- click-to-toggle repo selection with click-again-to-clear behavior
 - a clear top action row with `Shell`, `Codex`, `Claude`, `Mistral`, and `Custom`
+- a repo action row with scope targeting for the selected repo or all repos
 - a centered terminal stage that tiles panes more like a lightweight tiling window manager than a traditional IDE tab strip
 
 The styling is intentionally flat and lightweight: darker editor-style surfaces, thin borders, and minimal visual effects.
@@ -83,12 +86,16 @@ cargo build --release
 
 1. Select a repository from the left explorer.
 2. Launch a pane from the top action row with `Shell`, `Codex`, `Claude`, `Mistral`, or `Custom`.
-3. Double-click a repository row if you want the fastest path to a shell in that folder.
-4. Click any pane to focus it.
-5. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
-6. Double-click a pane header to zoom or unzoom it.
-7. Use the sidebar toggle if you want more room for terminals.
-8. Use `Commit+Push` on the focused pane when you want to stage, commit, and push from that repository.
+3. Click the selected repository again if you want to clear the current repo target.
+4. Double-click a repository row if you want the fastest path to a shell in that folder.
+5. Choose `Selected` or `All` in the repo action scope picker before running repo-wide git actions.
+6. Use `Fetch` when you only want remote tracking updated without changing the working tree.
+7. Use `Pull` when you want BelloSaize to fetch and then fast-forward only the repos that are safe to update.
+8. Click any pane to focus it.
+9. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
+10. Double-click a pane header to zoom or unzoom it.
+11. Use the sidebar toggle if you want more room for terminals.
+12. Use `Commit+Push` on the selected repo when you want to stage, commit, and push from it.
 
 Notes:
 
@@ -116,13 +123,25 @@ The explorer refresh checks each repository for:
 - ahead / behind tracking state against its remote
 - missing upstream or remote-check failures
 
-`Commit+Push` runs host-side git commands in the focused pane's tracked directory:
+`Fetch` runs host-side git commands in the chosen repo scope:
+
+1. `git fetch --all --prune`
+
+`Pull` runs host-side git commands in the chosen repo scope:
+
+1. `git fetch --all --prune`
+2. `git pull --ff-only` when the branch has an upstream, the working tree is clean, and the repo is only behind
+
+If BelloSaize fetches successfully but skips the pull for a repo, it shows the reason in the batch report instead of guessing between merge and rebase behavior.
+
+`Commit+Push` runs host-side git commands in the selected repo. If the focused pane is already inside that repo, BelloSaize uses the pane's tracked directory:
 
 1. `git add -A`
 2. `git commit -m ...`
 3. `git push`
 
 If the current branch has no upstream yet, BelloSaize falls back to `git push -u origin <branch>`.
+If the repo has no uncommitted changes but does have local commits ahead of upstream, BelloSaize skips the commit prompt and only runs the push step.
 
 Output is shown in a dialog instead of being injected into the running terminal process.
 

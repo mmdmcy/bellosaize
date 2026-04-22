@@ -10,19 +10,102 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use gio::prelude::*;
 use gtk::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CssProvider, Entry,
-    Grid, Label, ListBox, Orientation, Paned, ResponseType, ScrolledWindow, Stack, TextBuffer,
-    TextView, gdk, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CssProvider, DropDown,
+    Entry, Grid, Label, ListBox, Orientation, Paned, ResponseType, ScrolledWindow, Stack,
+    TextBuffer, TextView, gdk, prelude::*,
 };
 use pango::{EllipsizeMode, FontDescription};
 use vte::{CursorBlinkMode, PtyFlags, Terminal, prelude::*};
 
 use crate::{
     persist::{Profile, SessionFile, SessionSpec, load_or_bootstrap, save},
-    project::{ProjectInfo, default_roots, discover_projects, inspect_project},
+    project::{
+        ProjectInfo, RepoStatus, default_roots, discover_projects, inspect_project,
+        inspect_project_without_remote_refresh,
+    },
 };
 
 const APP_ID: &str = "com.mmdmcy.BelloSaize";
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RepoActionScope {
+    Selected,
+    All,
+}
+
+impl RepoActionScope {
+    fn from_index(index: u32) -> Self {
+        match index {
+            1 => Self::All,
+            _ => Self::Selected,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RepoAction {
+    Fetch,
+    Pull,
+}
+
+impl RepoAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Fetch => "Fetch",
+            Self::Pull => "Pull",
+        }
+    }
+
+    fn status_verb(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetched",
+            Self::Pull => "pulled",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RepoActionOutcome {
+    Applied,
+    Skipped,
+    Failed,
+}
+
+#[derive(Clone, Copy)]
+enum CommitPushMode {
+    CommitAndPush,
+    PushOnly,
+}
+
+impl CommitPushMode {
+    fn dialog_title(self) -> &'static str {
+        match self {
+            Self::CommitAndPush => "Commit And Push",
+            Self::PushOnly => "Push Local Commits",
+        }
+    }
+
+    fn report_title(self) -> &'static str {
+        match self {
+            Self::CommitAndPush => "Commit+Push",
+            Self::PushOnly => "Push",
+        }
+    }
+}
+
+struct RepoActionReport {
+    name: String,
+    path: PathBuf,
+    repo_status: RepoStatus,
+    output: String,
+    outcome: RepoActionOutcome,
+}
+
+#[derive(Clone)]
+struct CommitPushTarget {
+    cwd: PathBuf,
+    title: String,
+}
 
 pub fn run() -> Result<()> {
     let application = Application::builder().application_id(APP_ID).build();
@@ -54,6 +137,9 @@ struct AppState {
     reset_button: Button,
     close_button: Button,
     zoom_button: Button,
+    repo_scope_combo: DropDown,
+    fetch_button: Button,
+    pull_button: Button,
     commit_push_button: Button,
     session_file_path: PathBuf,
     project_roots: Vec<PathBuf>,
@@ -97,6 +183,10 @@ struct SidebarWidgets {
     project_list: ListBox,
     project_count_label: Label,
     refresh_button: Button,
+    repo_scope_combo: DropDown,
+    fetch_button: Button,
+    pull_button: Button,
+    commit_push_button: Button,
 }
 
 struct WorkspaceWidgets {
@@ -112,7 +202,6 @@ struct WorkspaceWidgets {
     launch_buttons: LaunchButtons,
     close_button: Button,
     zoom_button: Button,
-    commit_push_button: Button,
 }
 
 fn build_ui(application: &Application) -> Result<()> {
@@ -158,7 +247,10 @@ fn build_ui(application: &Application) -> Result<()> {
         reset_button: workspace_widgets.reset_button.clone(),
         close_button: workspace_widgets.close_button.clone(),
         zoom_button: workspace_widgets.zoom_button.clone(),
-        commit_push_button: workspace_widgets.commit_push_button.clone(),
+        repo_scope_combo: sidebar_widgets.repo_scope_combo.clone(),
+        fetch_button: sidebar_widgets.fetch_button.clone(),
+        pull_button: sidebar_widgets.pull_button.clone(),
+        commit_push_button: sidebar_widgets.commit_push_button.clone(),
         session_file_path,
         project_roots,
         projects: Vec::new(),
@@ -247,25 +339,23 @@ fn build_ui(application: &Application) -> Result<()> {
     }
     {
         let state = state.clone();
-        let commit_push_button = state.borrow().commit_push_button.clone();
-        commit_push_button.connect_clicked(move |_| prompt_commit_and_push(&state));
+        let repo_scope_combo = state.borrow().repo_scope_combo.clone();
+        repo_scope_combo.connect_selected_notify(move |_| update_project_ui(&state));
     }
     {
         let state = state.clone();
-        sidebar_widgets
-            .project_list
-            .connect_row_selected(move |_, row| {
-                let selected_index = row.and_then(|row| usize::try_from(row.index()).ok());
-                {
-                    let mut state_mut = state.borrow_mut();
-                    state_mut.selected_project_index =
-                        selected_index.filter(|index| *index < state_mut.projects.len());
-                }
-                update_project_ui(&state);
-                if let Some(project) = selected_project(&state) {
-                    push_status(&state, format!("selected repo: {}", project.path.display()));
-                }
-            });
+        let fetch_button = state.borrow().fetch_button.clone();
+        fetch_button.connect_clicked(move |_| run_repo_action_for_scope(&state, RepoAction::Fetch));
+    }
+    {
+        let state = state.clone();
+        let pull_button = state.borrow().pull_button.clone();
+        pull_button.connect_clicked(move |_| run_repo_action_for_scope(&state, RepoAction::Pull));
+    }
+    {
+        let state = state.clone();
+        let commit_push_button = state.borrow().commit_push_button.clone();
+        commit_push_button.connect_clicked(move |_| prompt_commit_and_push(&state));
     }
     {
         let state = state.clone();
@@ -303,21 +393,55 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
 
     let refresh_button = action_button("Refresh");
     refresh_button.set_tooltip_text(Some("Rescan the configured project roots."));
+    refresh_button.set_hexpand(true);
+
+    let repo_scope_combo = DropDown::from_strings(&["Selected", "All"]);
+    repo_scope_combo.set_selected(0);
+    repo_scope_combo.set_hexpand(true);
+    repo_scope_combo.set_tooltip_text(Some(
+        "Choose whether repo actions target the selected repo or every repo.",
+    ));
+
+    let scope_row = GtkBox::new(Orientation::Horizontal, 6);
+    scope_row.add_css_class("sidebar-toolbar-row");
+    scope_row.append(&refresh_button);
+    scope_row.append(&repo_scope_combo);
+
+    let fetch_button = action_button("Fetch");
+    fetch_button.set_tooltip_text(Some("Fetch remote changes for the chosen repo scope."));
+    let pull_button = action_button("Pull");
+    pull_button.set_tooltip_text(Some(
+        "Fetch, then fast-forward pull for the chosen repo scope when each repo is safe to update.",
+    ));
+    let commit_push_button = action_button("Commit+Push");
+    commit_push_button.add_css_class("primary-button");
+    commit_push_button.set_tooltip_text(Some(
+        "Commit pending changes, or push existing local commits, in the selected repo.",
+    ));
+
+    let git_row = GtkBox::new(Orientation::Horizontal, 6);
+    git_row.add_css_class("sidebar-toolbar-row");
+    git_row.append(&fetch_button);
+    git_row.append(&pull_button);
+    git_row.append(&commit_push_button);
 
     title_row.append(&title);
     title_row.append(&project_count_label);
 
-    let hint = Label::new(Some("Click a repo. Double-click to open a shell."));
+    let hint = Label::new(Some(
+        "Click a repo to toggle selection. Double-click to open a shell there.",
+    ));
     hint.add_css_class("hint-label");
     hint.set_wrap(true);
     hint.set_xalign(0.0);
 
     header.append(&title_row);
-    header.append(&refresh_button);
+    header.append(&scope_row);
+    header.append(&git_row);
 
     let project_list = ListBox::new();
     project_list.add_css_class("project-list");
-    project_list.set_selection_mode(gtk::SelectionMode::Single);
+    project_list.set_selection_mode(gtk::SelectionMode::None);
     project_list.set_vexpand(true);
 
     let scroller = ScrolledWindow::builder()
@@ -338,6 +462,10 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
             project_list,
             project_count_label,
             refresh_button,
+            repo_scope_combo,
+            fetch_button,
+            pull_button,
+            commit_push_button,
         },
     )
 }
@@ -420,13 +548,9 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
     ));
     let zoom_button = action_button("Zoom");
     let close_button = action_button("Close");
-    let commit_push_button = action_button("Commit+Push");
-    commit_push_button.add_css_class("primary-button");
-
     pane_group.append(&reset_button);
     pane_group.append(&zoom_button);
     pane_group.append(&close_button);
-    pane_group.append(&commit_push_button);
 
     toolbar_row.append(&launch_group);
     toolbar_row.append(&spacer);
@@ -492,7 +616,6 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
             },
             close_button,
             zoom_button,
-            commit_push_button,
         },
     )
 }
@@ -543,12 +666,11 @@ fn action_button(label: &str) -> Button {
 }
 
 fn refresh_projects(state: &SharedState) {
-    let (previous_path, roots, project_list) = {
+    let (previous_path, roots) = {
         let state = state.borrow();
         (
             selected_project_ref(&state).map(|project| project.path.to_string_lossy().to_string()),
             state.project_roots.clone(),
-            state.project_list.clone(),
         )
     };
 
@@ -571,32 +693,36 @@ fn refresh_projects(state: &SharedState) {
         project.repo_status = inspect_project(&project.path);
     }
 
+    let refresh_summary = describe_project_overview(&projects);
+
+    {
+        let mut state_mut = state.borrow_mut();
+        state_mut.projects = projects;
+        state_mut.selected_project_index = previous_path.and_then(|path| {
+            state_mut
+                .projects
+                .iter()
+                .position(|project| project.path.to_string_lossy() == path)
+        });
+    }
+
+    rebuild_project_list(state);
+    push_status(state, refresh_summary);
+}
+
+fn rebuild_project_list(state: &SharedState) {
+    let (project_list, projects_for_rows, selected_index) = {
+        let state = state.borrow();
+        (
+            state.project_list.clone(),
+            state.projects.clone(),
+            state.selected_project_index,
+        )
+    };
+
     while let Some(child) = project_list.first_child() {
         project_list.remove(&child);
     }
-
-    let refresh_summary = describe_project_overview(&projects);
-
-    let (projects_for_rows, selected_index) = {
-        let mut state_mut = state.borrow_mut();
-        state_mut.projects = projects;
-        state_mut.selected_project_index = if state_mut.projects.is_empty() {
-            None
-        } else {
-            Some(
-                previous_path
-                    .and_then(|path| {
-                        state_mut
-                            .projects
-                            .iter()
-                            .position(|project| project.path.to_string_lossy() == path)
-                    })
-                    .unwrap_or(0),
-            )
-        };
-
-        (state_mut.projects.clone(), state_mut.selected_project_index)
-    };
 
     for (index, project) in projects_for_rows.iter().enumerate() {
         let row = build_project_row(state, index, project);
@@ -608,8 +734,6 @@ fn refresh_projects(state: &SharedState) {
     } else {
         update_project_ui(state);
     }
-
-    push_status(state, refresh_summary);
 }
 
 fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -> gtk::ListBoxRow {
@@ -623,6 +747,7 @@ fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -
 
     let body = GtkBox::new(Orientation::Vertical, 2);
     body.add_css_class("project-row-body");
+    body.set_hexpand(true);
 
     let title_row = GtkBox::new(Orientation::Horizontal, 8);
 
@@ -649,19 +774,21 @@ fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -
     body.append(&path);
 
     let click = gtk::GestureClick::new();
+    click.set_button(1);
     {
         let state = state.clone();
-        click.connect_pressed(move |_, presses, _, _| {
-            if presses == 2 {
+        click.connect_released(move |_, presses, _, _| match presses {
+            2 => {
                 select_project_row(&state, index);
                 if let Some(project) = project_at_index(&state, index) {
                     add_profile_session_in_cwd(&state, Profile::Shell, project.path);
                 }
             }
+            1 => toggle_project_selection(&state, index),
+            _ => {}
         });
     }
-    body.add_controller(click);
-
+    row.add_controller(click);
     row.set_child(Some(&body));
     row
 }
@@ -673,8 +800,13 @@ fn update_project_ui(state: &SharedState) {
         workspace_title_label,
         workspace_path_label,
         workspace_repo_status_label,
+        fetch_button,
+        pull_button,
+        commit_push_button,
         selected_index,
         project_total,
+        action_target_count,
+        commit_push_enabled,
         selected_title,
         selected_path,
         selected_status,
@@ -687,8 +819,13 @@ fn update_project_ui(state: &SharedState) {
             state.workspace_title_label.clone(),
             state.workspace_path_label.clone(),
             state.workspace_repo_status_label.clone(),
+            state.fetch_button.clone(),
+            state.pull_button.clone(),
+            state.commit_push_button.clone(),
             state.selected_project_index,
             state.projects.len(),
+            repo_action_targets_from_state(&state).len(),
+            commit_push_mode_from_state(&state).is_some(),
             selected
                 .map(|project| project.name.clone())
                 .unwrap_or_else(|| "No repository selected".to_string()),
@@ -703,14 +840,21 @@ fn update_project_ui(state: &SharedState) {
         )
     };
 
-    project_count_label.set_text(&format!(
-        "{project_total} {}",
-        if project_total == 1 { "repo" } else { "repos" }
-    ));
+    project_count_label.set_text(&describe_project_count(project_total));
     workspace_title_label.set_text(&selected_title);
     workspace_path_label.set_text(&selected_path);
     workspace_repo_status_label.set_text(&selected_status);
+    fetch_button.set_sensitive(action_target_count > 0);
+    pull_button.set_sensitive(action_target_count > 0);
+    commit_push_button.set_sensitive(commit_push_enabled);
     update_project_row_classes(&project_list, selected_index);
+}
+
+fn describe_project_count(project_total: usize) -> String {
+    format!(
+        "{project_total} {}",
+        if project_total == 1 { "repo" } else { "repos" }
+    )
 }
 
 fn describe_project_overview(projects: &[ProjectInfo]) -> String {
@@ -769,10 +913,59 @@ fn update_project_row_classes(project_list: &ListBox, selected_index: Option<usi
 }
 
 fn select_project_row(state: &SharedState, index: usize) {
-    let project_list = state.borrow().project_list.clone();
-    if let Some(row) = project_list.row_at_index(index as i32) {
-        project_list.select_row(Some(&row));
+    set_selected_project_index(state, Some(index));
+}
+
+fn set_selected_project_index(state: &SharedState, index: Option<usize>) {
+    {
+        let mut state_mut = state.borrow_mut();
+        state_mut.selected_project_index = index.filter(|index| *index < state_mut.projects.len());
     }
+    update_project_ui(state);
+}
+
+fn toggle_project_selection(state: &SharedState, index: usize) {
+    let new_index = {
+        let state_ref = state.borrow();
+        if index >= state_ref.projects.len() {
+            return;
+        }
+
+        match state_ref.selected_project_index {
+            Some(selected_index) if selected_index == index => None,
+            _ => Some(index),
+        }
+    };
+
+    set_selected_project_index(state, new_index);
+
+    if let Some(project) = project_at_index(state, index) {
+        let message = if new_index.is_some() {
+            format!("selected repo: {}", project.path.display())
+        } else {
+            format!("cleared repo selection: {}", project.path.display())
+        };
+        push_status(state, message);
+    }
+}
+
+fn current_repo_action_scope(state: &AppState) -> RepoActionScope {
+    RepoActionScope::from_index(state.repo_scope_combo.selected())
+}
+
+fn repo_action_targets_from_state(state: &AppState) -> Vec<ProjectInfo> {
+    match current_repo_action_scope(state) {
+        RepoActionScope::Selected => selected_project_ref(state).cloned().into_iter().collect(),
+        RepoActionScope::All => state.projects.clone(),
+    }
+}
+
+fn repo_action_targets(state: &SharedState) -> (RepoActionScope, Vec<ProjectInfo>) {
+    let state = state.borrow();
+    (
+        current_repo_action_scope(&state),
+        repo_action_targets_from_state(&state),
+    )
 }
 
 fn toggle_sidebar(state: &SharedState) {
@@ -983,13 +1176,25 @@ fn prompt_custom_session(state: &SharedState, cwd_override: Option<PathBuf>) {
 
 #[allow(deprecated)]
 fn prompt_commit_and_push(state: &SharedState) {
-    if selected_session(state).is_none() {
+    let (target, mode) = {
+        let state = state.borrow();
+        let Some(target) = commit_push_target_from_state(&state) else {
+            return;
+        };
+        let Some(mode) = commit_push_mode_from_state(&state) else {
+            return;
+        };
+        (target, mode)
+    };
+
+    if matches!(mode, CommitPushMode::PushOnly) {
+        run_commit_and_push(state, target, mode, None);
         return;
     }
 
     let window = state.borrow().window.clone();
     let dialog = gtk::Dialog::builder()
-        .title("Commit And Push")
+        .title(mode.dialog_title())
         .transient_for(&window)
         .modal(true)
         .build();
@@ -1003,12 +1208,19 @@ fn prompt_commit_and_push(state: &SharedState) {
     content.set_margin_start(18);
     content.set_margin_end(18);
 
+    let target_label = Label::new(Some(&format!("Target: {}", target.cwd.display())));
+    target_label.add_css_class("hint-label");
+    target_label.set_wrap(true);
+    target_label.set_xalign(0.0);
+    content.append(&target_label);
+
     let entry = Entry::builder().placeholder_text("Commit message").build();
     content.append(&entry);
 
     {
         let state = state.clone();
         let entry = entry.clone();
+        let target = target.clone();
         dialog.connect_response(move |dialog, response| {
             if response == ResponseType::Accept {
                 let message = entry.text().trim().to_string();
@@ -1019,7 +1231,12 @@ fn prompt_commit_and_push(state: &SharedState) {
                         "Enter a commit message before continuing.",
                     );
                 } else {
-                    run_commit_and_push_for_selected(&state, message);
+                    run_commit_and_push(
+                        &state,
+                        target.clone(),
+                        CommitPushMode::CommitAndPush,
+                        Some(message),
+                    );
                 }
             }
             dialog.close();
@@ -1271,7 +1488,9 @@ fn update_layout(state: &SharedState) {
     state_mut.reset_button.set_sensitive(focused);
     state_mut.close_button.set_sensitive(focused);
     state_mut.zoom_button.set_sensitive(focused);
-    state_mut.commit_push_button.set_sensitive(focused);
+    state_mut
+        .commit_push_button
+        .set_sensitive(commit_push_mode_from_state(&state_mut).is_some());
 }
 
 fn attach_sessions(grid: &Grid, sessions: &[Rc<SessionView>]) {
@@ -1431,43 +1650,76 @@ fn toggle_zoom_for_id(state: &SharedState, id: u64) {
     push_status(state, message);
 }
 
-fn run_commit_and_push_for_selected(state: &SharedState, message: String) {
-    let Some(session) = selected_session(state) else {
-        return;
-    };
+fn run_commit_and_push(
+    state: &SharedState,
+    target: CommitPushTarget,
+    mode: CommitPushMode,
+    message: Option<String>,
+) {
+    let result = execute_commit_and_push(&target.cwd, message.as_deref());
+    refresh_project_status_for_cwd(state, &target.cwd);
 
-    let cwd = session.spec.borrow().cwd.clone();
-    let title = session.spec.borrow().title();
-    let result = execute_commit_and_push(&cwd, &message);
     match result {
         Ok(output) => {
             show_output_dialog(
                 &state.borrow().window,
-                &format!("Commit+Push for {title}"),
+                &format!("{} for {}", mode.report_title(), target.title),
                 &output,
             );
-            push_status(state, format!("commit+push finished in {}", cwd.display()));
+            push_status(
+                state,
+                format!(
+                    "{} finished in {}",
+                    mode.report_title().to_lowercase(),
+                    target.cwd.display()
+                ),
+            );
         }
         Err(error) => {
             show_output_dialog(
                 &state.borrow().window,
-                "Commit+Push Failed",
+                &format!("{} Failed", mode.report_title()),
                 &format!("{error:#}"),
             );
         }
     }
 }
 
-fn execute_commit_and_push(cwd: &Path, message: &str) -> Result<String> {
+fn run_repo_action_for_scope(state: &SharedState, action: RepoAction) {
+    let (scope, targets) = repo_action_targets(state);
+    if targets.is_empty() {
+        return;
+    }
+
+    let reports = targets
+        .iter()
+        .map(|project| execute_repo_action(action, project))
+        .collect::<Vec<_>>();
+
+    apply_repo_action_reports(state, &reports);
+
+    let summary = summarize_repo_action(action, scope, &reports);
+    let details = render_repo_action_report(action, &reports);
+    push_status_with_details(state, summary, Some(details));
+}
+
+fn execute_commit_and_push(cwd: &Path, message: Option<&str>) -> Result<String> {
     let mut transcript = Vec::new();
-    transcript.push(format_git_step(
-        "git add -A",
-        run_git_command(cwd, &["add", "-A"])?,
-    ));
-    transcript.push(format_git_step(
-        &format!("git commit -m {:?}", message),
-        run_git_command(cwd, &["commit", "-m", message])?,
-    ));
+
+    if let Some(message) = message {
+        transcript.push(format_git_step(
+            "git add -A",
+            run_git_command(cwd, &["add", "-A"])?,
+        ));
+        transcript.push(format_git_step(
+            &format!("git commit -m {:?}", message),
+            run_git_command(cwd, &["commit", "-m", message])?,
+        ));
+    } else {
+        transcript.push(
+            "No uncommitted changes detected, so BelloSaize only pushed local commits.".to_string(),
+        );
+    }
 
     let current_branch = current_git_branch(cwd)?;
     let push_attempt = run_git_command(cwd, &["push"]);
@@ -1493,9 +1745,258 @@ fn execute_commit_and_push(cwd: &Path, message: &str) -> Result<String> {
     Ok(transcript.join("\n\n"))
 }
 
+fn execute_fetch(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
+    let mut transcript = Vec::new();
+    let has_remote = git_has_remote(cwd)?;
+    if !has_remote {
+        let status = inspect_project_without_remote_refresh(cwd);
+        transcript.push("No remote configured, so there was nothing to fetch.".to_string());
+        return Ok((transcript.join("\n\n"), status, RepoActionOutcome::Skipped));
+    }
+
+    transcript.push(format_git_step(
+        "git fetch --quiet --all --prune",
+        run_git_command(
+            cwd,
+            &[
+                "-c",
+                "credential.interactive=never",
+                "fetch",
+                "--quiet",
+                "--all",
+                "--prune",
+            ],
+        )?,
+    ));
+
+    let status_after_fetch = inspect_project_without_remote_refresh(cwd);
+    transcript.push(format!(
+        "Final status: {}",
+        status_after_fetch.short_label()
+    ));
+    Ok((
+        transcript.join("\n\n"),
+        status_after_fetch,
+        RepoActionOutcome::Applied,
+    ))
+}
+
+fn execute_pull(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
+    let mut transcript = Vec::new();
+    let has_remote = git_has_remote(cwd)?;
+    if !has_remote {
+        let status = inspect_project_without_remote_refresh(cwd);
+        transcript.push("No remote configured, so there was nothing to pull.".to_string());
+        return Ok((transcript.join("\n\n"), status, RepoActionOutcome::Skipped));
+    }
+
+    transcript.push(format_git_step(
+        "git fetch --quiet --all --prune",
+        run_git_command(
+            cwd,
+            &[
+                "-c",
+                "credential.interactive=never",
+                "fetch",
+                "--quiet",
+                "--all",
+                "--prune",
+            ],
+        )?,
+    ));
+
+    let status_after_fetch = inspect_project_without_remote_refresh(cwd);
+    if !status_after_fetch.available {
+        transcript.push("Repository status is unavailable after fetch.".to_string());
+        return Ok((
+            transcript.join("\n\n"),
+            status_after_fetch,
+            RepoActionOutcome::Skipped,
+        ));
+    }
+
+    if !status_after_fetch.has_upstream {
+        transcript.push(
+            "Fetched remotes, but skipped pull because the current branch has no upstream."
+                .to_string(),
+        );
+        return Ok((
+            transcript.join("\n\n"),
+            status_after_fetch,
+            RepoActionOutcome::Skipped,
+        ));
+    }
+
+    if status_after_fetch.dirty {
+        transcript.push(
+            "Fetched remotes, but skipped pull because the working tree has uncommitted changes."
+                .to_string(),
+        );
+        return Ok((
+            transcript.join("\n\n"),
+            status_after_fetch,
+            RepoActionOutcome::Skipped,
+        ));
+    }
+
+    if status_after_fetch.behind == 0 {
+        transcript.push("Already up to date after fetch.".to_string());
+        return Ok((
+            transcript.join("\n\n"),
+            status_after_fetch,
+            RepoActionOutcome::Skipped,
+        ));
+    }
+
+    if status_after_fetch.ahead > 0 {
+        transcript.push(
+            "Fetched remotes, but skipped pull because the branch has local commits and is not a clean fast-forward."
+                .to_string(),
+        );
+        return Ok((
+            transcript.join("\n\n"),
+            status_after_fetch,
+            RepoActionOutcome::Skipped,
+        ));
+    }
+
+    transcript.push(format_git_step(
+        "git pull --ff-only",
+        run_git_command(
+            cwd,
+            &["-c", "credential.interactive=never", "pull", "--ff-only"],
+        )?,
+    ));
+
+    let final_status = inspect_project_without_remote_refresh(cwd);
+    transcript.push(format!("Final status: {}", final_status.short_label()));
+    Ok((
+        transcript.join("\n\n"),
+        final_status,
+        RepoActionOutcome::Applied,
+    ))
+}
+
+fn execute_repo_action(action: RepoAction, project: &ProjectInfo) -> RepoActionReport {
+    let result = match action {
+        RepoAction::Fetch => execute_fetch(&project.path),
+        RepoAction::Pull => execute_pull(&project.path),
+    };
+
+    match result {
+        Ok((output, repo_status, outcome)) => RepoActionReport {
+            name: project.name.clone(),
+            path: project.path.clone(),
+            repo_status,
+            output,
+            outcome,
+        },
+        Err(error) => RepoActionReport {
+            name: project.name.clone(),
+            path: project.path.clone(),
+            repo_status: inspect_project(&project.path),
+            output: format!("{error:#}"),
+            outcome: RepoActionOutcome::Failed,
+        },
+    }
+}
+
+fn apply_repo_action_reports(state: &SharedState, reports: &[RepoActionReport]) {
+    {
+        let mut state = state.borrow_mut();
+        for project in &mut state.projects {
+            if let Some(report) = reports.iter().find(|report| report.path == project.path) {
+                project.repo_status = report.repo_status.clone();
+            }
+        }
+    }
+    rebuild_project_list(state);
+}
+
+fn render_repo_action_report(action: RepoAction, reports: &[RepoActionReport]) -> String {
+    reports
+        .iter()
+        .map(|report| {
+            format!(
+                "{} [{}]\nPath: {}\nStatus: {}\n\n{}",
+                report.name,
+                match report.outcome {
+                    RepoActionOutcome::Applied => action.status_verb().to_uppercase(),
+                    RepoActionOutcome::Skipped => "SKIPPED".to_string(),
+                    RepoActionOutcome::Failed => "FAILED".to_string(),
+                },
+                report.path.display(),
+                report.repo_status.short_label(),
+                report.output,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n----------------------------------------\n\n")
+}
+
+fn summarize_repo_action(
+    action: RepoAction,
+    scope: RepoActionScope,
+    reports: &[RepoActionReport],
+) -> String {
+    let applied = reports
+        .iter()
+        .filter(|report| matches!(report.outcome, RepoActionOutcome::Applied))
+        .count();
+    let skipped = reports
+        .iter()
+        .filter(|report| matches!(report.outcome, RepoActionOutcome::Skipped))
+        .count();
+    let failed = reports
+        .iter()
+        .filter(|report| matches!(report.outcome, RepoActionOutcome::Failed))
+        .count();
+
+    format!(
+        "{} {} ({applied} {}, {skipped} skipped, {failed} failed)",
+        action.label().to_lowercase(),
+        describe_repo_scope_target_count(scope, reports.len()),
+        action.status_verb()
+    )
+}
+
+fn describe_repo_scope_target_count(scope: RepoActionScope, count: usize) -> String {
+    match scope {
+        RepoActionScope::Selected if count == 1 => "selected repo".to_string(),
+        RepoActionScope::All => format!("{count} {}", if count == 1 { "repo" } else { "repos" }),
+        RepoActionScope::Selected => {
+            format!("{count} {}", if count == 1 { "repo" } else { "repos" })
+        }
+    }
+}
+
+fn git_has_remote(cwd: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["remote"])
+        .output()
+        .with_context(|| format!("failed to run `git remote` in {}", cwd.display()))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git remote exited with status {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| !line.trim().is_empty()))
+}
+
 fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
-    command.current_dir(cwd).args(args);
+    command
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args);
 
     let output = command.output().with_context(|| {
         format!(
@@ -1631,23 +2132,92 @@ fn selected_project_ref(state: &AppState) -> Option<&ProjectInfo> {
         .and_then(|index| state.projects.get(index))
 }
 
-fn selected_project(state: &SharedState) -> Option<ProjectInfo> {
-    let state = state.borrow();
-    selected_project_ref(&state).cloned()
-}
-
 fn project_at_index(state: &SharedState, index: usize) -> Option<ProjectInfo> {
     state.borrow().projects.get(index).cloned()
 }
 
+fn selected_session_ref(state: &AppState) -> Option<&Rc<SessionView>> {
+    let id = state.selected_session_id?;
+    state.sessions.iter().find(|session| session.id == id)
+}
+
 fn selected_session(state: &SharedState) -> Option<Rc<SessionView>> {
     let state = state.borrow();
-    let id = state.selected_session_id?;
-    state
-        .sessions
-        .iter()
-        .find(|session| session.id == id)
-        .cloned()
+    selected_session_ref(&state).cloned()
+}
+
+fn commit_push_target_from_state(state: &AppState) -> Option<CommitPushTarget> {
+    let selected_project = selected_project_ref(state)?;
+    let selected_session = selected_session_ref(state);
+
+    match selected_session {
+        Some(session) => {
+            let session_spec = session.spec.borrow();
+            if path_is_within_repo(&session_spec.cwd, &selected_project.path) {
+                return Some(CommitPushTarget {
+                    cwd: session_spec.cwd.clone(),
+                    title: session_spec.title(),
+                });
+            }
+
+            Some(CommitPushTarget {
+                cwd: selected_project.path.clone(),
+                title: selected_project.name.clone(),
+            })
+        }
+        None => Some(CommitPushTarget {
+            cwd: selected_project.path.clone(),
+            title: selected_project.name.clone(),
+        }),
+    }
+}
+
+fn commit_push_mode_from_state(state: &AppState) -> Option<CommitPushMode> {
+    selected_project_ref(state)
+        .and_then(|project| commit_push_mode_for_status(&project.repo_status))
+}
+
+fn commit_push_mode_for_status(status: &RepoStatus) -> Option<CommitPushMode> {
+    if status.dirty {
+        Some(CommitPushMode::CommitAndPush)
+    } else if status.ahead > 0 {
+        Some(CommitPushMode::PushOnly)
+    } else {
+        None
+    }
+}
+
+fn path_is_within_repo(path: &Path, repo_root: &Path) -> bool {
+    path == repo_root || path.starts_with(repo_root)
+}
+
+fn refresh_project_status_for_cwd(state: &SharedState, cwd: &Path) {
+    let repo_path = {
+        let state_ref = state.borrow();
+        state_ref
+            .projects
+            .iter()
+            .find(|project| path_is_within_repo(cwd, &project.path))
+            .map(|project| project.path.clone())
+    };
+
+    let Some(repo_path) = repo_path else {
+        return;
+    };
+
+    let refreshed_status = inspect_project(&repo_path);
+    {
+        let mut state_mut = state.borrow_mut();
+        if let Some(project) = state_mut
+            .projects
+            .iter_mut()
+            .find(|project| project.path == repo_path)
+        {
+            project.repo_status = refreshed_status;
+        }
+    }
+
+    rebuild_project_list(state);
 }
 
 fn next_session_id(state: &SharedState) -> u64 {
@@ -1658,7 +2228,13 @@ fn next_session_id(state: &SharedState) -> u64 {
 }
 
 fn push_status(state: &SharedState, message: String) {
-    state.borrow().status_label.set_text(&message);
+    push_status_with_details(state, message, None);
+}
+
+fn push_status_with_details(state: &SharedState, message: String, details: Option<String>) {
+    let status_label = state.borrow().status_label.clone();
+    status_label.set_text(&message);
+    status_label.set_tooltip_text(details.as_deref());
 }
 
 fn kill_all_sessions(state: &SharedState) {

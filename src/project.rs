@@ -136,11 +136,20 @@ fn collect_project(path: &Path, seen: &mut HashSet<PathBuf>, projects: &mut Vec<
 }
 
 pub fn inspect_project(path: &Path) -> RepoStatus {
+    inspect_project_with_remote_refresh(path, true)
+}
+
+pub fn inspect_project_without_remote_refresh(path: &Path) -> RepoStatus {
+    inspect_project_with_remote_refresh(path, false)
+}
+
+fn inspect_project_with_remote_refresh(path: &Path, refresh_remote: bool) -> RepoStatus {
     let has_remote = git_stdout(path, &["remote"])
         .ok()
         .is_some_and(|output| output.lines().any(|line| !line.trim().is_empty()));
 
-    let remote_refresh_failed = has_remote
+    let remote_refresh_failed = refresh_remote
+        && has_remote
         && git_stdout(
             path,
             &[
