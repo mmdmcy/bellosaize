@@ -143,7 +143,7 @@ If BelloSaize fetches successfully but skips the pull for a repo, it shows the r
 If the current branch has no upstream yet, BelloSaize falls back to `git push -u origin <branch>`.
 If the repo has no uncommitted changes but does have local commits ahead of upstream, BelloSaize skips the commit prompt and only runs the push step.
 
-Output is shown in a dialog instead of being injected into the running terminal process.
+Progress is shown in the footer status area with a simple spinner, and the latest transcript is kept on the status tooltip instead of opening a second popup.
 
 ## Status
 

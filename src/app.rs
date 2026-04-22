@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     rc::Rc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -151,6 +152,7 @@ struct AppState {
     sidebar_visible: bool,
     last_sidebar_width: i32,
     next_session_id: u64,
+    repo_action_busy: bool,
 }
 
 struct SessionView {
@@ -261,6 +263,7 @@ fn build_ui(application: &Application) -> Result<()> {
         sidebar_visible: true,
         last_sidebar_width: 260,
         next_session_id: 1,
+        repo_action_busy: false,
     }));
 
     {
@@ -806,6 +809,7 @@ fn update_project_ui(state: &SharedState) {
         selected_index,
         project_total,
         action_target_count,
+        repo_action_busy,
         commit_push_enabled,
         selected_title,
         selected_path,
@@ -825,6 +829,7 @@ fn update_project_ui(state: &SharedState) {
             state.selected_project_index,
             state.projects.len(),
             repo_action_targets_from_state(&state).len(),
+            state.repo_action_busy,
             commit_push_mode_from_state(&state).is_some(),
             selected
                 .map(|project| project.name.clone())
@@ -844,9 +849,9 @@ fn update_project_ui(state: &SharedState) {
     workspace_title_label.set_text(&selected_title);
     workspace_path_label.set_text(&selected_path);
     workspace_repo_status_label.set_text(&selected_status);
-    fetch_button.set_sensitive(action_target_count > 0);
-    pull_button.set_sensitive(action_target_count > 0);
-    commit_push_button.set_sensitive(commit_push_enabled);
+    fetch_button.set_sensitive(!repo_action_busy && action_target_count > 0);
+    pull_button.set_sensitive(!repo_action_busy && action_target_count > 0);
+    commit_push_button.set_sensitive(!repo_action_busy && commit_push_enabled);
     update_project_row_classes(&project_list, selected_index);
 }
 
@@ -1176,6 +1181,10 @@ fn prompt_custom_session(state: &SharedState, cwd_override: Option<PathBuf>) {
 
 #[allow(deprecated)]
 fn prompt_commit_and_push(state: &SharedState) {
+    if state.borrow().repo_action_busy {
+        return;
+    }
+
     let (target, mode) = {
         let state = state.borrow();
         let Some(target) = commit_push_target_from_state(&state) else {
@@ -1217,27 +1226,48 @@ fn prompt_commit_and_push(state: &SharedState) {
     let entry = Entry::builder().placeholder_text("Commit message").build();
     content.append(&entry);
 
+    let validation_label = Label::new(Some("Enter a commit message before continuing."));
+    validation_label.add_css_class("hint-label");
+    validation_label.set_xalign(0.0);
+    validation_label.set_wrap(true);
+    validation_label.set_visible(false);
+    content.append(&validation_label);
+
+    dialog.set_default_response(ResponseType::Accept);
+    dialog.set_response_sensitive(ResponseType::Accept, false);
+
+    {
+        let dialog = dialog.clone();
+        let validation_label = validation_label.clone();
+        entry.connect_changed(move |entry| {
+            let has_message = !entry.text().trim().is_empty();
+            dialog.set_response_sensitive(ResponseType::Accept, has_message);
+            if has_message {
+                validation_label.set_visible(false);
+            }
+        });
+    }
+
     {
         let state = state.clone();
         let entry = entry.clone();
         let target = target.clone();
+        let validation_label = validation_label.clone();
         dialog.connect_response(move |dialog, response| {
             if response == ResponseType::Accept {
                 let message = entry.text().trim().to_string();
                 if message.is_empty() {
-                    show_output_dialog(
-                        &state.borrow().window,
-                        "Missing Commit Message",
-                        "Enter a commit message before continuing.",
-                    );
-                } else {
-                    run_commit_and_push(
-                        &state,
-                        target.clone(),
-                        CommitPushMode::CommitAndPush,
-                        Some(message),
-                    );
+                    validation_label.set_visible(true);
+                    entry.grab_focus();
+                    return;
                 }
+
+                run_commit_and_push(
+                    &state,
+                    target.clone(),
+                    CommitPushMode::CommitAndPush,
+                    Some(message),
+                );
             }
             dialog.close();
         });
@@ -1656,33 +1686,45 @@ fn run_commit_and_push(
     mode: CommitPushMode,
     message: Option<String>,
 ) {
-    let result = execute_commit_and_push(&target.cwd, message.as_deref());
-    refresh_project_status_for_cwd(state, &target.cwd);
+    set_repo_action_busy(state, true);
 
-    match result {
-        Ok(output) => {
-            show_output_dialog(
-                &state.borrow().window,
-                &format!("{} for {}", mode.report_title(), target.title),
-                &output,
-            );
-            push_status(
-                state,
-                format!(
-                    "{} finished in {}",
-                    mode.report_title().to_lowercase(),
-                    target.cwd.display()
-                ),
-            );
+    let pending_message = match mode {
+        CommitPushMode::CommitAndPush => format!("Commit+Push running for {}", target.title),
+        CommitPushMode::PushOnly => format!("Push running for {}", target.title),
+    };
+    let spinner_id = start_status_spinner(
+        state,
+        pending_message,
+        Some(format!("Path: {}", target.cwd.display())),
+    );
+
+    let cwd = target.cwd.clone();
+    let job = gio::spawn_blocking(move || execute_commit_and_push(&cwd, message.as_deref()));
+
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let result = match job.await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("background git task panicked")),
+        };
+
+        spinner_id.remove();
+        refresh_project_status_for_cwd(&state, &target.cwd);
+        set_repo_action_busy(&state, false);
+
+        match result {
+            Ok(output) => push_status_with_details(
+                &state,
+                format!("{} finished for {}", mode.report_title(), target.title),
+                Some(format!("Path: {}\n\n{}", target.cwd.display(), output)),
+            ),
+            Err(error) => push_status_with_details(
+                &state,
+                format!("{} failed for {}", mode.report_title(), target.title),
+                Some(format!("Path: {}\n\n{error:#}", target.cwd.display())),
+            ),
         }
-        Err(error) => {
-            show_output_dialog(
-                &state.borrow().window,
-                &format!("{} Failed", mode.report_title()),
-                &format!("{error:#}"),
-            );
-        }
-    }
+    });
 }
 
 fn run_repo_action_for_scope(state: &SharedState, action: RepoAction) {
@@ -2227,6 +2269,11 @@ fn next_session_id(state: &SharedState) -> u64 {
     next
 }
 
+fn set_repo_action_busy(state: &SharedState, busy: bool) {
+    state.borrow_mut().repo_action_busy = busy;
+    update_project_ui(state);
+}
+
 fn push_status(state: &SharedState, message: String) {
     push_status_with_details(state, message, None);
 }
@@ -2235,6 +2282,27 @@ fn push_status_with_details(state: &SharedState, message: String, details: Optio
     let status_label = state.borrow().status_label.clone();
     status_label.set_text(&message);
     status_label.set_tooltip_text(details.as_deref());
+}
+
+fn start_status_spinner(
+    state: &SharedState,
+    message: String,
+    details: Option<String>,
+) -> glib::SourceId {
+    const FRAMES: [&str; 4] = ["/", "-", "\\", "|"];
+
+    let status_label = state.borrow().status_label.clone();
+    status_label.set_tooltip_text(details.as_deref());
+
+    let frame_index = Cell::new(0usize);
+    status_label.set_text(&format!("{} {}", FRAMES[0], message));
+
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        let next = (frame_index.get() + 1) % FRAMES.len();
+        frame_index.set(next);
+        status_label.set_text(&format!("{} {}", FRAMES[next], message));
+        glib::ControlFlow::Continue
+    })
 }
 
 fn kill_all_sessions(state: &SharedState) {
