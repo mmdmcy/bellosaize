@@ -43,31 +43,13 @@ impl RepoActionScope {
     }
 }
 
-#[derive(Clone, Copy)]
-enum RepoAction {
-    Fetch,
-    Pull,
-}
-
-impl RepoAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Fetch => "Fetch",
-            Self::Pull => "Pull",
-        }
-    }
-
-    fn status_verb(self) -> &'static str {
-        match self {
-            Self::Fetch => "fetched",
-            Self::Pull => "pulled",
-        }
-    }
-}
+const GITHUB_UPDATE_LABEL: &str = "Get Up To Date";
+const SPINNER_FRAMES: [&str; 4] = ["/", "-", "\\", "|"];
 
 #[derive(Clone, Copy)]
 enum RepoActionOutcome {
-    Applied,
+    Updated,
+    UpToDate,
     Skipped,
     Failed,
 }
@@ -92,6 +74,30 @@ impl CommitPushMode {
             Self::PushOnly => "Push",
         }
     }
+
+    fn busy_kind(self) -> RepoBusyKind {
+        match self {
+            Self::CommitAndPush => RepoBusyKind::CommitPush,
+            Self::PushOnly => RepoBusyKind::Push,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RepoBusyKind {
+    Sync,
+    CommitPush,
+    Push,
+}
+
+impl RepoBusyKind {
+    fn status_label(self) -> &'static str {
+        match self {
+            Self::Sync => "Syncing",
+            Self::CommitPush => "Commit+Push",
+            Self::Push => "Push",
+        }
+    }
 }
 
 struct RepoActionReport {
@@ -104,8 +110,16 @@ struct RepoActionReport {
 
 #[derive(Clone)]
 struct CommitPushTarget {
+    repo_path: PathBuf,
     cwd: PathBuf,
     title: String,
+}
+
+#[derive(Clone)]
+struct RepoBusyFeedback {
+    kind: RepoBusyKind,
+    target_paths: Vec<PathBuf>,
+    frame: usize,
 }
 
 pub fn run() -> Result<()> {
@@ -140,9 +154,9 @@ struct AppState {
     close_button: Button,
     zoom_button: Button,
     repo_scope_combo: DropDown,
-    fetch_button: Button,
-    pull_button: Button,
+    github_update_button: Button,
     commit_push_button: Button,
+    project_status_labels: Vec<Label>,
     session_file_path: PathBuf,
     project_roots: Vec<PathBuf>,
     projects: Vec<ProjectInfo>,
@@ -154,6 +168,7 @@ struct AppState {
     last_sidebar_width: i32,
     next_session_id: u64,
     repo_action_busy: bool,
+    repo_busy_feedback: Option<RepoBusyFeedback>,
     refresh_busy: bool,
 }
 
@@ -188,8 +203,7 @@ struct SidebarWidgets {
     project_count_label: Label,
     refresh_button: Button,
     repo_scope_combo: DropDown,
-    fetch_button: Button,
-    pull_button: Button,
+    github_update_button: Button,
     commit_push_button: Button,
 }
 
@@ -253,9 +267,9 @@ fn build_ui(application: &Application) -> Result<()> {
         close_button: workspace_widgets.close_button.clone(),
         zoom_button: workspace_widgets.zoom_button.clone(),
         repo_scope_combo: sidebar_widgets.repo_scope_combo.clone(),
-        fetch_button: sidebar_widgets.fetch_button.clone(),
-        pull_button: sidebar_widgets.pull_button.clone(),
+        github_update_button: sidebar_widgets.github_update_button.clone(),
         commit_push_button: sidebar_widgets.commit_push_button.clone(),
+        project_status_labels: Vec::new(),
         session_file_path,
         project_roots,
         projects: Vec::new(),
@@ -267,6 +281,7 @@ fn build_ui(application: &Application) -> Result<()> {
         last_sidebar_width: 260,
         next_session_id: 1,
         repo_action_busy: false,
+        repo_busy_feedback: None,
         refresh_busy: false,
     }));
 
@@ -351,13 +366,8 @@ fn build_ui(application: &Application) -> Result<()> {
     }
     {
         let state = state.clone();
-        let fetch_button = state.borrow().fetch_button.clone();
-        fetch_button.connect_clicked(move |_| run_repo_action_for_scope(&state, RepoAction::Fetch));
-    }
-    {
-        let state = state.clone();
-        let pull_button = state.borrow().pull_button.clone();
-        pull_button.connect_clicked(move |_| run_repo_action_for_scope(&state, RepoAction::Pull));
+        let github_update_button = state.borrow().github_update_button.clone();
+        github_update_button.connect_clicked(move |_| run_repo_update_for_scope(&state));
     }
     {
         let state = state.clone();
@@ -414,13 +424,13 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
     scope_row.append(&refresh_button);
     scope_row.append(&repo_scope_combo);
 
-    let fetch_button = action_button("Fetch");
-    fetch_button.set_tooltip_text(Some("Fetch remote changes for the chosen repo scope."));
-    let pull_button = action_button("Pull");
-    pull_button.set_tooltip_text(Some(
-        "Fetch, then fast-forward pull for the chosen repo scope when each repo is safe to update.",
+    let github_update_button = action_button(GITHUB_UPDATE_LABEL);
+    github_update_button.set_hexpand(true);
+    github_update_button.set_tooltip_text(Some(
+        "Fetch remote changes, then fast-forward each repo when it is safe to update.",
     ));
     let commit_push_button = action_button("Commit+Push");
+    commit_push_button.set_hexpand(true);
     commit_push_button.add_css_class("primary-button");
     commit_push_button.set_tooltip_text(Some(
         "Commit pending changes, or push existing local commits, in the selected repo.",
@@ -428,8 +438,7 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
 
     let git_row = GtkBox::new(Orientation::Horizontal, 6);
     git_row.add_css_class("sidebar-toolbar-row");
-    git_row.append(&fetch_button);
-    git_row.append(&pull_button);
+    git_row.append(&github_update_button);
     git_row.append(&commit_push_button);
 
     title_row.append(&title);
@@ -470,8 +479,7 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
             project_count_label,
             refresh_button,
             repo_scope_combo,
-            fetch_button,
-            pull_button,
+            github_update_button,
             commit_push_button,
         },
     )
@@ -773,10 +781,14 @@ fn rebuild_project_list(state: &SharedState) {
         project_list.remove(&child);
     }
 
+    let mut status_labels = Vec::with_capacity(projects_for_rows.len());
     for (index, project) in projects_for_rows.iter().enumerate() {
-        let row = build_project_row(state, index, project);
+        let (row, status_label) = build_project_row(state, index, project);
+        status_labels.push(status_label);
         project_list.append(&row);
     }
+
+    state.borrow_mut().project_status_labels = status_labels;
 
     if let Some(index) = selected_index {
         select_project_row(state, index);
@@ -785,7 +797,11 @@ fn rebuild_project_list(state: &SharedState) {
     }
 }
 
-fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -> gtk::ListBoxRow {
+fn build_project_row(
+    state: &SharedState,
+    index: usize,
+    project: &ProjectInfo,
+) -> (gtk::ListBoxRow, Label) {
     let row = gtk::ListBoxRow::new();
     row.add_css_class("project-row");
     row.set_tooltip_text(Some(&format!(
@@ -839,7 +855,7 @@ fn build_project_row(state: &SharedState, index: usize, project: &ProjectInfo) -
     }
     row.add_controller(click);
     row.set_child(Some(&body));
-    row
+    (row, repo_status)
 }
 
 fn update_project_ui(state: &SharedState) {
@@ -851,9 +867,11 @@ fn update_project_ui(state: &SharedState) {
         workspace_title_label,
         workspace_path_label,
         workspace_repo_status_label,
-        fetch_button,
-        pull_button,
+        github_update_button,
         commit_push_button,
+        project_status_labels,
+        projects_for_status,
+        repo_busy_feedback,
         selected_index,
         project_total,
         action_target_count,
@@ -863,9 +881,13 @@ fn update_project_ui(state: &SharedState) {
         selected_title,
         selected_path,
         selected_status,
+        selected_status_busy,
     ) = {
         let state = state.borrow();
         let selected = selected_project_ref(&state);
+        let selected_status_busy = selected.is_some_and(|project| {
+            repo_feedback_targets_project(state.repo_busy_feedback.as_ref(), &project.path)
+        });
         (
             state.project_list.clone(),
             state.project_count_label.clone(),
@@ -874,9 +896,11 @@ fn update_project_ui(state: &SharedState) {
             state.workspace_title_label.clone(),
             state.workspace_path_label.clone(),
             state.workspace_repo_status_label.clone(),
-            state.fetch_button.clone(),
-            state.pull_button.clone(),
+            state.github_update_button.clone(),
             state.commit_push_button.clone(),
+            state.project_status_labels.clone(),
+            state.projects.clone(),
+            state.repo_busy_feedback.clone(),
             state.selected_project_index,
             state.projects.len(),
             repo_action_targets_from_state(&state).len(),
@@ -892,11 +916,15 @@ fn update_project_ui(state: &SharedState) {
                     "Select a repository on the left, then start a terminal session.".to_string()
                 }),
             selected
-                .map(|project| format!("Git: {}", project.repo_status.short_label()))
+                .map(|project| {
+                    workspace_repo_status_text(project, state.repo_busy_feedback.as_ref())
+                })
                 .unwrap_or_else(|| "Select a repository to inspect its git state.".to_string()),
+            selected_status_busy,
         )
     };
     let app_busy = repo_action_busy || refresh_busy;
+    let repo_busy_kind = repo_busy_feedback.as_ref().map(|feedback| feedback.kind);
 
     project_count_label.set_text(&describe_project_count(project_total));
     refresh_button.set_label(if refresh_busy {
@@ -915,10 +943,111 @@ fn update_project_ui(state: &SharedState) {
     workspace_title_label.set_text(&selected_title);
     workspace_path_label.set_text(&selected_path);
     workspace_repo_status_label.set_text(&selected_status);
-    fetch_button.set_sensitive(!app_busy && action_target_count > 0);
-    pull_button.set_sensitive(!app_busy && action_target_count > 0);
+    if selected_status_busy {
+        workspace_repo_status_label.add_css_class("workspace-repo-status-busy");
+    } else {
+        workspace_repo_status_label.remove_css_class("workspace-repo-status-busy");
+    }
+    github_update_button.set_label(if repo_busy_kind == Some(RepoBusyKind::Sync) {
+        "Syncing..."
+    } else {
+        GITHUB_UPDATE_LABEL
+    });
+    commit_push_button.set_label(match repo_busy_kind {
+        Some(RepoBusyKind::CommitPush) => "Commit+Push...",
+        Some(RepoBusyKind::Push) => "Pushing...",
+        _ => "Commit+Push",
+    });
+    if repo_busy_kind == Some(RepoBusyKind::Sync) {
+        github_update_button.add_css_class("busy-button");
+    } else {
+        github_update_button.remove_css_class("busy-button");
+    }
+    if matches!(
+        repo_busy_kind,
+        Some(RepoBusyKind::CommitPush | RepoBusyKind::Push)
+    ) {
+        commit_push_button.add_css_class("busy-button");
+    } else {
+        commit_push_button.remove_css_class("busy-button");
+    }
+    github_update_button.set_sensitive(!app_busy && action_target_count > 0);
     commit_push_button.set_sensitive(!app_busy && commit_push_enabled);
+    update_project_status_labels(
+        &project_status_labels,
+        &projects_for_status,
+        repo_busy_feedback.as_ref(),
+    );
     update_project_row_classes(&project_list, selected_index);
+}
+
+fn workspace_repo_status_text(
+    project: &ProjectInfo,
+    feedback: Option<&RepoBusyFeedback>,
+) -> String {
+    format!(
+        "Git: {}",
+        repo_status_label_text(project, feedback)
+            .unwrap_or_else(|| project.repo_status.short_label())
+    )
+}
+
+fn update_project_status_labels(
+    labels: &[Label],
+    projects: &[ProjectInfo],
+    feedback: Option<&RepoBusyFeedback>,
+) {
+    for (label, project) in labels.iter().zip(projects) {
+        let busy = repo_feedback_targets_project(feedback, &project.path);
+        label.set_text(
+            &repo_status_label_text(project, feedback)
+                .unwrap_or_else(|| project.repo_status.short_label()),
+        );
+        apply_repo_status_label_class(label, &project.repo_status, busy);
+    }
+}
+
+fn repo_status_label_text(
+    project: &ProjectInfo,
+    feedback: Option<&RepoBusyFeedback>,
+) -> Option<String> {
+    let feedback = feedback?;
+    if !repo_feedback_targets_project(Some(feedback), &project.path) {
+        return None;
+    }
+
+    Some(format!(
+        "{} {}",
+        SPINNER_FRAMES[feedback.frame],
+        feedback.kind.status_label()
+    ))
+}
+
+fn repo_feedback_targets_project(feedback: Option<&RepoBusyFeedback>, project_path: &Path) -> bool {
+    feedback.is_some_and(|feedback| {
+        feedback
+            .target_paths
+            .iter()
+            .any(|target_path| target_path == project_path)
+    })
+}
+
+fn apply_repo_status_label_class(label: &Label, status: &RepoStatus, busy: bool) {
+    for class_name in [
+        "repo-state-ok",
+        "repo-state-warn",
+        "repo-state-alert",
+        "repo-state-muted",
+        "repo-state-busy",
+    ] {
+        label.remove_css_class(class_name);
+    }
+
+    label.add_css_class(if busy {
+        "repo-state-busy"
+    } else {
+        status.css_class()
+    });
 }
 
 fn describe_project_count(project_total: usize) -> String {
@@ -1762,6 +1891,8 @@ fn run_commit_and_push(
         pending_message,
         Some(format!("Path: {}", target.cwd.display())),
     );
+    let repo_spinner_id =
+        start_repo_status_spinner(state, vec![target.repo_path.clone()], mode.busy_kind());
 
     let cwd = target.cwd.clone();
     let job = gio::spawn_blocking(move || execute_commit_and_push(&cwd, message.as_deref()));
@@ -1770,6 +1901,7 @@ fn run_commit_and_push(
     glib::MainContext::default().spawn_local(async move {
         let result = job.await;
         spinner_id.remove();
+        stop_repo_status_spinner(&state, repo_spinner_id);
         match result {
             Ok((result, repo_status)) => {
                 apply_repo_status_for_cwd(&state, &target.cwd, repo_status);
@@ -1783,7 +1915,12 @@ fn run_commit_and_push(
                     ),
                     Err(error) => push_status_with_details(
                         &state,
-                        format!("{} failed for {}", mode.report_title(), target.title),
+                        format!(
+                            "{} failed for {}: {}",
+                            mode.report_title(),
+                            target.title,
+                            first_error_line(&error)
+                        ),
                         Some(format!("Path: {}\n\n{error:#}", target.cwd.display())),
                     ),
                 }
@@ -1803,7 +1940,7 @@ fn run_commit_and_push(
     });
 }
 
-fn run_repo_action_for_scope(state: &SharedState, action: RepoAction) {
+fn run_repo_update_for_scope(state: &SharedState) {
     let (scope, targets, busy) = {
         let state = state.borrow();
         (
@@ -1820,17 +1957,25 @@ fn run_repo_action_for_scope(state: &SharedState, action: RepoAction) {
     let spinner_id = start_status_spinner(
         state,
         format!(
-            "{} {}",
-            action.label(),
+            "{} for {}",
+            GITHUB_UPDATE_LABEL,
             describe_repo_scope_target_count(scope, targets.len())
         ),
         Some(format_repo_action_targets(&targets)),
+    );
+    let repo_spinner_id = start_repo_status_spinner(
+        state,
+        targets
+            .iter()
+            .map(|project| project.path.clone())
+            .collect::<Vec<_>>(),
+        RepoBusyKind::Sync,
     );
 
     let job = gio::spawn_blocking(move || {
         targets
             .into_iter()
-            .map(|project| execute_repo_action(action, &project))
+            .map(|project| execute_repo_update(&project))
             .collect::<Vec<_>>()
     });
 
@@ -1838,20 +1983,21 @@ fn run_repo_action_for_scope(state: &SharedState, action: RepoAction) {
     glib::MainContext::default().spawn_local(async move {
         let result = job.await;
         spinner_id.remove();
+        stop_repo_status_spinner(&state, repo_spinner_id);
         match result {
             Ok(reports) => {
                 apply_repo_action_reports(&state, &reports);
                 set_repo_action_busy(&state, false);
 
-                let summary = summarize_repo_action(action, scope, &reports);
-                let details = render_repo_action_report(action, &reports);
+                let summary = summarize_repo_update(scope, &reports);
+                let details = render_repo_update_report(&reports);
                 push_status_with_details(&state, summary, Some(details));
             }
             Err(_) => {
                 set_repo_action_busy(&state, false);
                 push_status_with_details(
                     &state,
-                    format!("{} failed", action.label()),
+                    format!("{GITHUB_UPDATE_LABEL} failed"),
                     Some("Background git task panicked.".to_string()),
                 );
             }
@@ -1877,6 +2023,7 @@ fn execute_commit_and_push_inner(cwd: &Path, message: Option<&str>) -> Result<St
     let mut transcript = Vec::new();
 
     if let Some(message) = message {
+        ensure_git_commit_identity(cwd)?;
         transcript.push(format_git_step(
             "git add -A",
             run_git_command(cwd, &["add", "-A"])?,
@@ -1915,48 +2062,18 @@ fn execute_commit_and_push_inner(cwd: &Path, message: Option<&str>) -> Result<St
     Ok(transcript.join("\n\n"))
 }
 
-fn execute_fetch(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
-    let mut transcript = Vec::new();
-    let has_remote = git_has_remote(cwd)?;
-    if !has_remote {
-        let status = inspect_project_without_remote_refresh(cwd);
-        transcript.push("No remote configured, so there was nothing to fetch.".to_string());
-        return Ok((transcript.join("\n\n"), status, RepoActionOutcome::Skipped));
-    }
-
-    transcript.push(format_git_step(
-        "git fetch --quiet --all --prune",
-        run_git_command(
-            cwd,
-            &[
-                "-c",
-                "credential.interactive=never",
-                "fetch",
-                "--quiet",
-                "--all",
-                "--prune",
-            ],
-        )?,
-    ));
-
-    let status_after_fetch = inspect_project_without_remote_refresh(cwd);
-    transcript.push(format!(
-        "Final status: {}",
-        status_after_fetch.short_label()
-    ));
-    Ok((
-        transcript.join("\n\n"),
-        status_after_fetch,
-        RepoActionOutcome::Applied,
-    ))
+fn ensure_git_commit_identity(cwd: &Path) -> Result<()> {
+    run_git_command(cwd, &["var", "GIT_AUTHOR_IDENT"])
+        .map(|_| ())
+        .context("git commit identity is not configured; set user.name and user.email")
 }
 
-fn execute_pull(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
+fn execute_github_update(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
     let mut transcript = Vec::new();
     let has_remote = git_has_remote(cwd)?;
     if !has_remote {
         let status = inspect_project_without_remote_refresh(cwd);
-        transcript.push("No remote configured, so there was nothing to pull.".to_string());
+        transcript.push("No remote configured, so there was nothing to update.".to_string());
         return Ok((transcript.join("\n\n"), status, RepoActionOutcome::Skipped));
     }
 
@@ -1987,7 +2104,7 @@ fn execute_pull(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
 
     if !status_after_fetch.has_upstream {
         transcript.push(
-            "Fetched remotes, but skipped pull because the current branch has no upstream."
+            "Fetched remotes, but skipped the fast-forward because the current branch has no upstream."
                 .to_string(),
         );
         return Ok((
@@ -1999,7 +2116,7 @@ fn execute_pull(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
 
     if status_after_fetch.dirty {
         transcript.push(
-            "Fetched remotes, but skipped pull because the working tree has uncommitted changes."
+            "Fetched remotes, but skipped the fast-forward because the working tree has uncommitted changes."
                 .to_string(),
         );
         return Ok((
@@ -2014,13 +2131,13 @@ fn execute_pull(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
         return Ok((
             transcript.join("\n\n"),
             status_after_fetch,
-            RepoActionOutcome::Skipped,
+            RepoActionOutcome::UpToDate,
         ));
     }
 
     if status_after_fetch.ahead > 0 {
         transcript.push(
-            "Fetched remotes, but skipped pull because the branch has local commits and is not a clean fast-forward."
+            "Fetched remotes, but skipped the fast-forward because the branch has local commits."
                 .to_string(),
         );
         return Ok((
@@ -2043,15 +2160,12 @@ fn execute_pull(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
     Ok((
         transcript.join("\n\n"),
         final_status,
-        RepoActionOutcome::Applied,
+        RepoActionOutcome::Updated,
     ))
 }
 
-fn execute_repo_action(action: RepoAction, project: &ProjectInfo) -> RepoActionReport {
-    let result = match action {
-        RepoAction::Fetch => execute_fetch(&project.path),
-        RepoAction::Pull => execute_pull(&project.path),
-    };
+fn execute_repo_update(project: &ProjectInfo) -> RepoActionReport {
+    let result = execute_github_update(&project.path);
 
     match result {
         Ok((output, repo_status, outcome)) => RepoActionReport {
@@ -2083,7 +2197,7 @@ fn apply_repo_action_reports(state: &SharedState, reports: &[RepoActionReport]) 
     rebuild_project_list(state);
 }
 
-fn render_repo_action_report(action: RepoAction, reports: &[RepoActionReport]) -> String {
+fn render_repo_update_report(reports: &[RepoActionReport]) -> String {
     reports
         .iter()
         .map(|report| {
@@ -2091,7 +2205,8 @@ fn render_repo_action_report(action: RepoAction, reports: &[RepoActionReport]) -
                 "{} [{}]\nPath: {}\nStatus: {}\n\n{}",
                 report.name,
                 match report.outcome {
-                    RepoActionOutcome::Applied => action.status_verb().to_uppercase(),
+                    RepoActionOutcome::Updated => "UPDATED".to_string(),
+                    RepoActionOutcome::UpToDate => "UP TO DATE".to_string(),
                     RepoActionOutcome::Skipped => "SKIPPED".to_string(),
                     RepoActionOutcome::Failed => "FAILED".to_string(),
                 },
@@ -2104,14 +2219,14 @@ fn render_repo_action_report(action: RepoAction, reports: &[RepoActionReport]) -
         .join("\n\n----------------------------------------\n\n")
 }
 
-fn summarize_repo_action(
-    action: RepoAction,
-    scope: RepoActionScope,
-    reports: &[RepoActionReport],
-) -> String {
-    let applied = reports
+fn summarize_repo_update(scope: RepoActionScope, reports: &[RepoActionReport]) -> String {
+    let updated = reports
         .iter()
-        .filter(|report| matches!(report.outcome, RepoActionOutcome::Applied))
+        .filter(|report| matches!(report.outcome, RepoActionOutcome::Updated))
+        .count();
+    let up_to_date = reports
+        .iter()
+        .filter(|report| matches!(report.outcome, RepoActionOutcome::UpToDate))
         .count();
     let skipped = reports
         .iter()
@@ -2123,10 +2238,9 @@ fn summarize_repo_action(
         .count();
 
     format!(
-        "{} {} ({applied} {}, {skipped} skipped, {failed} failed)",
-        action.label().to_lowercase(),
+        "{} finished for {} ({updated} updated, {up_to_date} already up to date, {skipped} skipped, {failed} failed)",
+        GITHUB_UPDATE_LABEL,
         describe_repo_scope_target_count(scope, reports.len()),
-        action.status_verb()
     )
 }
 
@@ -2203,6 +2317,15 @@ fn run_git_command(cwd: &Path, args: &[&str]) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n")
     ))
+}
+
+fn first_error_line(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("unknown error")
+        .to_string()
 }
 
 fn current_git_branch(cwd: &Path) -> Result<String> {
@@ -2325,17 +2448,20 @@ fn commit_push_target_from_state(state: &AppState) -> Option<CommitPushTarget> {
             let session_spec = session.spec.borrow();
             if path_is_within_repo(&session_spec.cwd, &selected_project.path) {
                 return Some(CommitPushTarget {
+                    repo_path: selected_project.path.clone(),
                     cwd: session_spec.cwd.clone(),
                     title: session_spec.title(),
                 });
             }
 
             Some(CommitPushTarget {
+                repo_path: selected_project.path.clone(),
                 cwd: selected_project.path.clone(),
                 title: selected_project.name.clone(),
             })
         }
         None => Some(CommitPushTarget {
+            repo_path: selected_project.path.clone(),
             cwd: selected_project.path.clone(),
             title: selected_project.name.clone(),
         }),
@@ -2421,20 +2547,53 @@ fn start_status_spinner(
     message: String,
     details: Option<String>,
 ) -> glib::SourceId {
-    const FRAMES: [&str; 4] = ["/", "-", "\\", "|"];
-
     let status_label = state.borrow().status_label.clone();
     status_label.set_tooltip_text(details.as_deref());
 
     let frame_index = Cell::new(0usize);
-    status_label.set_text(&format!("{} {}", FRAMES[0], message));
+    status_label.set_text(&format!("{} {}", SPINNER_FRAMES[0], message));
 
     glib::timeout_add_local(Duration::from_millis(120), move || {
-        let next = (frame_index.get() + 1) % FRAMES.len();
+        let next = (frame_index.get() + 1) % SPINNER_FRAMES.len();
         frame_index.set(next);
-        status_label.set_text(&format!("{} {}", FRAMES[next], message));
+        status_label.set_text(&format!("{} {}", SPINNER_FRAMES[next], message));
         glib::ControlFlow::Continue
     })
+}
+
+fn start_repo_status_spinner(
+    state: &SharedState,
+    target_paths: Vec<PathBuf>,
+    kind: RepoBusyKind,
+) -> glib::SourceId {
+    {
+        let mut state_mut = state.borrow_mut();
+        state_mut.repo_busy_feedback = Some(RepoBusyFeedback {
+            kind,
+            target_paths,
+            frame: 0,
+        });
+    }
+    update_project_ui(state);
+
+    let state = state.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        {
+            let mut state_mut = state.borrow_mut();
+            let Some(feedback) = state_mut.repo_busy_feedback.as_mut() else {
+                return glib::ControlFlow::Break;
+            };
+            feedback.frame = (feedback.frame + 1) % SPINNER_FRAMES.len();
+        }
+        update_project_ui(&state);
+        glib::ControlFlow::Continue
+    })
+}
+
+fn stop_repo_status_spinner(state: &SharedState, spinner_id: glib::SourceId) {
+    spinner_id.remove();
+    state.borrow_mut().repo_busy_feedback = None;
+    update_project_ui(state);
 }
 
 fn kill_all_sessions(state: &SharedState) {
@@ -2708,6 +2867,16 @@ fn apply_css() {
         .repo-state-muted {
             background: #303030;
             color: #b7b7b7;
+        }
+
+        .repo-state-busy {
+            background: #094771;
+            color: #ffffff;
+        }
+
+        .workspace-repo-status-busy {
+            color: #ffffff;
+            font-weight: 700;
         }
 
         .empty-state {

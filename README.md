@@ -8,7 +8,7 @@ It is built for the workflow where the heavy work already happens inside the age
 - automatic tiling for 1, 2, 3, 4, and larger pane counts
 - VS Code-inspired workspace shell with a collapsible repo explorer
 - click-to-focus panes, double-click-to-zoom headers
-- separate repo-scoped `Fetch` and `Pull` actions with batch targeting
+- one repo-scoped `Get Up To Date` action with batch targeting
 - selected-repo `Commit+Push` flow that also handles push-only repos
 
 This is a normal desktop app. It does not run a browser UI, it does not need `localhost`, and it does not depend on Electron.
@@ -89,13 +89,12 @@ cargo build --release
 3. Click the selected repository again if you want to clear the current repo target.
 4. Double-click a repository row if you want the fastest path to a shell in that folder.
 5. Choose `Selected` or `All` in the repo action scope picker before running repo-wide git actions.
-6. Use `Fetch` when you only want remote tracking updated without changing the working tree.
-7. Use `Pull` when you want BelloSaize to fetch and then fast-forward only the repos that are safe to update.
-8. Click any pane to focus it.
-9. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
-10. Double-click a pane header to zoom or unzoom it.
-11. Use the sidebar toggle if you want more room for terminals.
-12. Use `Commit+Push` on the selected repo when you want to stage, commit, and push from it.
+6. Use `Get Up To Date` when you want BelloSaize to fetch and then fast-forward only the repos that are safe to update.
+7. Click any pane to focus it.
+8. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
+9. Double-click a pane header to zoom or unzoom it.
+10. Use the sidebar toggle if you want more room for terminals.
+11. Use `Commit+Push` on the selected repo when you want to stage, commit, and push from it.
 
 Notes:
 
@@ -123,16 +122,12 @@ The explorer refresh checks each repository for:
 - ahead / behind tracking state against its remote
 - missing upstream or remote-check failures
 
-`Fetch` runs host-side git commands in the chosen repo scope:
-
-1. `git fetch --all --prune`
-
-`Pull` runs host-side git commands in the chosen repo scope:
+`Get Up To Date` runs host-side git commands in the chosen repo scope:
 
 1. `git fetch --all --prune`
 2. `git pull --ff-only` when the branch has an upstream, the working tree is clean, and the repo is only behind
 
-If BelloSaize fetches successfully but skips the pull for a repo, it shows the reason in the batch report instead of guessing between merge and rebase behavior.
+If BelloSaize fetches successfully but skips the fast-forward for a repo, it shows the reason in the batch report instead of guessing between merge and rebase behavior.
 
 `Commit+Push` runs host-side git commands in the selected repo. If the focused pane is already inside that repo, BelloSaize uses the pane's tracked directory:
 
@@ -143,7 +138,7 @@ If BelloSaize fetches successfully but skips the pull for a repo, it shows the r
 If the current branch has no upstream yet, BelloSaize falls back to `git push -u origin <branch>`.
 If the repo has no uncommitted changes but does have local commits ahead of upstream, BelloSaize skips the commit prompt and only runs the push step.
 
-Progress is shown in the footer status area with a simple spinner, and the latest transcript is kept on the status tooltip instead of opening a second popup.
+Progress is shown in the footer status area and active repo status badges with a simple spinner, and the latest transcript is kept on the status tooltip instead of opening a second popup.
 
 ## Status
 
