@@ -89,7 +89,7 @@ cargo build --release
 3. Click the selected repository again if you want to clear the current repo target.
 4. Double-click a repository row if you want the fastest path to a shell in that folder.
 5. Choose `Selected` or `All` in the repo action scope picker before running repo-wide git actions.
-6. Use `Get Up To Date` when you want BelloSaize to fetch and then fast-forward only the repos that are safe to update.
+6. Use `Get Up To Date` when you want BelloSaize to fetch and update repos from GitHub. If a targeted repo has local changes or local commits, BelloSaize asks before discarding them.
 7. Click any pane to focus it.
 8. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
 9. Double-click a pane header to zoom or unzoom it.
@@ -126,6 +126,7 @@ The explorer refresh checks each repository for:
 
 1. `git fetch --all --prune`
 2. `git pull --ff-only` when the branch has an upstream, the working tree is clean, and the repo is only behind
+3. `git reset --hard @{upstream}` and `git clean -fd` only after confirmation when the repo has local changes or local commits that would otherwise block the update
 
 If BelloSaize fetches successfully but skips the fast-forward for a repo, it shows the reason in the batch report instead of guessing between merge and rebase behavior.
 

@@ -55,6 +55,12 @@ enum RepoActionOutcome {
 }
 
 #[derive(Clone, Copy)]
+enum RepoUpdateMode {
+    Safe,
+    DiscardLocal,
+}
+
+#[derive(Clone, Copy)]
 enum CommitPushMode {
     CommitAndPush,
     PushOnly,
@@ -427,7 +433,7 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
     let github_update_button = action_button(GITHUB_UPDATE_LABEL);
     github_update_button.set_hexpand(true);
     github_update_button.set_tooltip_text(Some(
-        "Fetch remote changes, then fast-forward each repo when it is safe to update.",
+        "Fetch remote changes, fast-forward safe repos, and ask before discarding local work.",
     ));
     let commit_push_button = action_button("Commit+Push");
     commit_push_button.set_hexpand(true);
@@ -1953,6 +1959,104 @@ fn run_repo_update_for_scope(state: &SharedState) {
         return;
     }
 
+    let discard_targets = targets
+        .iter()
+        .filter(|project| repo_update_needs_discard_confirmation(&project.repo_status))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !discard_targets.is_empty() {
+        prompt_discarding_repo_update(state, scope, targets, discard_targets);
+        return;
+    }
+
+    run_repo_update(state, scope, targets, Vec::new());
+}
+
+#[allow(deprecated)]
+fn prompt_discarding_repo_update(
+    state: &SharedState,
+    scope: RepoActionScope,
+    targets: Vec<ProjectInfo>,
+    discard_targets: Vec<ProjectInfo>,
+) {
+    let window = state.borrow().window.clone();
+    let dialog = gtk::Dialog::builder()
+        .title("Discard Local Work?")
+        .transient_for(&window)
+        .modal(true)
+        .build();
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button("Discard And Update", ResponseType::Accept);
+    dialog.set_default_response(ResponseType::Cancel);
+
+    let content = dialog.content_area();
+    content.set_spacing(10);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let warning = Label::new(Some(
+        "Some targeted repos have uncommitted changes or local commits. Continuing will reset those branches to their upstream, discard uncommitted changes, delete untracked files, and drop local commits.",
+    ));
+    warning.set_wrap(true);
+    warning.set_xalign(0.0);
+    content.append(&warning);
+
+    let target_list = Label::new(Some(&format_discard_update_targets(&discard_targets)));
+    target_list.add_css_class("hint-label");
+    target_list.set_selectable(true);
+    target_list.set_wrap(true);
+    target_list.set_xalign(0.0);
+    content.append(&target_list);
+
+    {
+        let state = state.clone();
+        dialog.connect_response(move |dialog, response| {
+            if response == ResponseType::Accept {
+                let discard_paths = discard_targets
+                    .iter()
+                    .map(|project| project.path.clone())
+                    .collect::<Vec<_>>();
+                run_repo_update(&state, scope, targets.clone(), discard_paths);
+            } else {
+                push_status(&state, format!("{GITHUB_UPDATE_LABEL} cancelled"));
+            }
+            dialog.close();
+        });
+    }
+
+    dialog.present();
+}
+
+fn repo_update_needs_discard_confirmation(status: &RepoStatus) -> bool {
+    status.available
+        && status.has_remote
+        && status.has_upstream
+        && (status.dirty || status.ahead > 0)
+}
+
+fn format_discard_update_targets(targets: &[ProjectInfo]) -> String {
+    targets
+        .iter()
+        .map(|project| {
+            format!(
+                "{} ({})\n{}",
+                project.name,
+                project.repo_status.short_label(),
+                project.path.display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn run_repo_update(
+    state: &SharedState,
+    scope: RepoActionScope,
+    targets: Vec<ProjectInfo>,
+    discard_paths: Vec<PathBuf>,
+) {
     set_repo_action_busy(state, true);
     let spinner_id = start_status_spinner(
         state,
@@ -1975,7 +2079,17 @@ fn run_repo_update_for_scope(state: &SharedState) {
     let job = gio::spawn_blocking(move || {
         targets
             .into_iter()
-            .map(|project| execute_repo_update(&project))
+            .map(|project| {
+                let mode = if discard_paths
+                    .iter()
+                    .any(|discard_path| discard_path == &project.path)
+                {
+                    RepoUpdateMode::DiscardLocal
+                } else {
+                    RepoUpdateMode::Safe
+                };
+                execute_repo_update(&project, mode)
+            })
             .collect::<Vec<_>>()
     });
 
@@ -2068,7 +2182,10 @@ fn ensure_git_commit_identity(cwd: &Path) -> Result<()> {
         .context("git commit identity is not configured; set user.name and user.email")
 }
 
-fn execute_github_update(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOutcome)> {
+fn execute_github_update(
+    cwd: &Path,
+    mode: RepoUpdateMode,
+) -> Result<(String, RepoStatus, RepoActionOutcome)> {
     let mut transcript = Vec::new();
     let has_remote = git_has_remote(cwd)?;
     if !has_remote {
@@ -2111,6 +2228,29 @@ fn execute_github_update(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOu
             transcript.join("\n\n"),
             status_after_fetch,
             RepoActionOutcome::Skipped,
+        ));
+    }
+
+    if matches!(mode, RepoUpdateMode::DiscardLocal)
+        && (status_after_fetch.dirty || status_after_fetch.ahead > 0)
+    {
+        transcript
+            .push("Discarding local work because you confirmed the reset to upstream.".to_string());
+        transcript.push(format_git_step(
+            "git reset --hard @{upstream}",
+            run_git_command(cwd, &["reset", "--hard", "@{upstream}"])?,
+        ));
+        transcript.push(format_git_step(
+            "git clean -fd",
+            run_git_command(cwd, &["clean", "-fd"])?,
+        ));
+
+        let final_status = inspect_project_without_remote_refresh(cwd);
+        transcript.push(format!("Final status: {}", final_status.short_label()));
+        return Ok((
+            transcript.join("\n\n"),
+            final_status,
+            RepoActionOutcome::Updated,
         ));
     }
 
@@ -2164,8 +2304,8 @@ fn execute_github_update(cwd: &Path) -> Result<(String, RepoStatus, RepoActionOu
     ))
 }
 
-fn execute_repo_update(project: &ProjectInfo) -> RepoActionReport {
-    let result = execute_github_update(&project.path);
+fn execute_repo_update(project: &ProjectInfo, mode: RepoUpdateMode) -> RepoActionReport {
+    let result = execute_github_update(&project.path, mode);
 
     match result {
         Ok((output, repo_status, outcome)) => RepoActionReport {
