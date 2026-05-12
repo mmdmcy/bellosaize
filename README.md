@@ -8,7 +8,7 @@ It is built for the workflow where the heavy work already happens inside the age
 - automatic tiling for 1, 2, 3, 4, and larger pane counts
 - VS Code-inspired workspace shell with a collapsible repo explorer
 - click-to-focus panes, double-click-to-zoom headers
-- one repo-scoped `Get Up To Date` action with batch targeting
+- one repo-scoped `Get Up To Date` action with current, marked, or all-repo targeting
 - selected-repo `Commit+Push` flow that also handles push-only repos
 
 This is a normal desktop app. It does not run a browser UI, it does not need `localhost`, and it does not depend on Electron.
@@ -88,13 +88,14 @@ cargo build --release
 2. Launch a pane from the top action row with `Shell`, `Codex`, `Claude`, `Mistral`, or `Custom`.
 3. Click the selected repository again if you want to clear the current repo target.
 4. Double-click a repository row if you want the fastest path to a shell in that folder.
-5. Choose `Selected` or `All` in the repo action scope picker before running repo-wide git actions.
-6. Use `Get Up To Date` when you want BelloSaize to fetch and update repos from GitHub. If a targeted repo has local changes or local commits, BelloSaize asks before discarding them.
-7. Click any pane to focus it.
-8. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
-9. Double-click a pane header to zoom or unzoom it.
-10. Use the sidebar toggle if you want more room for terminals.
-11. Use `Commit+Push` on the selected repo when you want to stage, commit, and push from it.
+5. Tick individual repositories when you want to build a marked batch target.
+6. Choose `Current`, `Marked`, or `All` in the repo action target picker before running `Get Up To Date`.
+7. Use `Get Up To Date` when you want BelloSaize to fetch and update repos from GitHub. If a targeted repo has local changes or local commits, BelloSaize asks before discarding them.
+8. Click any pane to focus it.
+9. Use `Reset` on the focused pane if you want to kill it and relaunch the same repo and command from scratch.
+10. Double-click a pane header to zoom or unzoom it.
+11. Use the sidebar toggle if you want more room for terminals.
+12. Use `Commit+Push` on the selected repo when you want to stage, commit, and push from it.
 
 Notes:
 
@@ -116,7 +117,7 @@ If nothing is found, it falls back to the current working directory.
 
 ## Git Integration
 
-The explorer refresh checks each repository for:
+`Refresh All` checks each discovered repository for:
 
 - local dirtiness
 - ahead / behind tracking state against its remote

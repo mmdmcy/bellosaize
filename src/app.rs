@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     path::{Path, PathBuf},
     process::Command,
@@ -11,9 +11,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use gio::prelude::*;
 use gtk::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CssProvider, DropDown,
-    Entry, Grid, Label, ListBox, Orientation, Paned, ResponseType, ScrolledWindow, Stack,
-    TextBuffer, TextView, gdk, prelude::*,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, CenterBox, CheckButton,
+    CssProvider, DropDown, Entry, Grid, Label, ListBox, Orientation, Paned, ResponseType,
+    ScrolledWindow, Stack, TextBuffer, TextView, gdk, prelude::*,
 };
 use pango::{EllipsizeMode, FontDescription};
 use vte::{CursorBlinkMode, PtyFlags, Terminal, prelude::*};
@@ -30,15 +30,17 @@ const APP_ID: &str = "com.mmdmcy.BelloSaize";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RepoActionScope {
-    Selected,
+    Current,
+    Marked,
     All,
 }
 
 impl RepoActionScope {
     fn from_index(index: u32) -> Self {
         match index {
-            1 => Self::All,
-            _ => Self::Selected,
+            1 => Self::Marked,
+            2 => Self::All,
+            _ => Self::Current,
         }
     }
 }
@@ -171,6 +173,7 @@ struct AppState {
     project_roots: Vec<PathBuf>,
     projects: Vec<ProjectInfo>,
     selected_project_index: Option<usize>,
+    repo_action_target_paths: BTreeSet<PathBuf>,
     sessions: Vec<Rc<SessionView>>,
     selected_session_id: Option<u64>,
     zoomed_session_id: Option<u64>,
@@ -294,6 +297,7 @@ fn build_ui(application: &Application) -> Result<()> {
         project_roots,
         projects: Vec::new(),
         selected_project_index: None,
+        repo_action_target_paths: BTreeSet::new(),
         sessions: Vec::new(),
         selected_session_id: None,
         zoomed_session_id: None,
@@ -435,15 +439,17 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
     let project_count_label = Label::new(Some("0 repos"));
     project_count_label.add_css_class("count-label");
 
-    let refresh_button = action_button("Refresh");
-    refresh_button.set_tooltip_text(Some("Rescan the configured project roots."));
+    let refresh_button = action_button("Refresh All");
+    refresh_button.set_tooltip_text(Some(
+        "Rescan configured roots and refresh status for every discovered repo. This does not pull or push.",
+    ));
     refresh_button.set_hexpand(true);
 
-    let repo_scope_combo = DropDown::from_strings(&["Selected", "All"]);
+    let repo_scope_combo = DropDown::from_strings(&["Current", "Marked", "All"]);
     repo_scope_combo.set_selected(0);
     repo_scope_combo.set_hexpand(true);
     repo_scope_combo.set_tooltip_text(Some(
-        "Choose whether repo actions target the selected repo or every repo.",
+        "Choose whether Get Up To Date targets the current repo, checked repos, or every discovered repo.",
     ));
 
     let scope_row = GtkBox::new(Orientation::Horizontal, 6);
@@ -454,7 +460,7 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
     let github_update_button = action_button(GITHUB_UPDATE_LABEL);
     github_update_button.set_hexpand(true);
     github_update_button.set_tooltip_text(Some(
-        "Fetch remote changes, fast-forward safe repos, and ask before discarding local work.",
+        "Fetch remote changes for the chosen target, fast-forward safe repos, and ask before discarding local work.",
     ));
     let commit_push_button = action_button("Commit+Push");
     commit_push_button.set_hexpand(true);
@@ -472,7 +478,7 @@ fn build_sidebar() -> (GtkBox, SidebarWidgets) {
     title_row.append(&project_count_label);
 
     let hint = Label::new(Some(
-        "Click a repo to toggle selection. Double-click to open a shell there.",
+        "Click a repo to focus it. Tick repos to target a marked batch. Double-click opens a shell.",
     ));
     hint.add_css_class("hint-label");
     hint.set_wrap(true);
@@ -787,6 +793,14 @@ fn refresh_projects(state: &SharedState) {
                 {
                     let mut state_mut = state.borrow_mut();
                     state_mut.projects = projects;
+                    let available_paths = state_mut
+                        .projects
+                        .iter()
+                        .map(|project| project.path.clone())
+                        .collect::<BTreeSet<_>>();
+                    state_mut
+                        .repo_action_target_paths
+                        .retain(|path| available_paths.contains(path));
                     state_mut.dirty_changes_for_path = None;
                     state_mut.selected_project_index = previous_path.and_then(|path| {
                         state_mut
@@ -889,9 +903,35 @@ fn build_project_row(
         project.repo_status.short_label()
     )));
 
-    let body = GtkBox::new(Orientation::Vertical, 2);
+    let body = GtkBox::new(Orientation::Horizontal, 8);
     body.add_css_class("project-row-body");
     body.set_hexpand(true);
+
+    let marked_for_action = state
+        .borrow()
+        .repo_action_target_paths
+        .contains(&project.path);
+    let target_check = CheckButton::new();
+    target_check.add_css_class("repo-target-check");
+    target_check.set_tooltip_text(Some("Mark this repo for batch Get Up To Date actions."));
+    target_check.set_active(marked_for_action);
+    target_check.set_valign(Align::Center);
+    {
+        let state = state.clone();
+        let project_name = project.name.clone();
+        let project_path = project.path.clone();
+        target_check.connect_toggled(move |button| {
+            set_repo_action_target(
+                &state,
+                project_name.clone(),
+                project_path.clone(),
+                button.is_active(),
+            );
+        });
+    }
+
+    let text_body = GtkBox::new(Orientation::Vertical, 2);
+    text_body.set_hexpand(true);
 
     let title_row = GtkBox::new(Orientation::Horizontal, 8);
 
@@ -914,8 +954,10 @@ fn build_project_row(
     path.set_xalign(0.0);
     path.set_ellipsize(EllipsizeMode::Middle);
 
-    body.append(&title_row);
-    body.append(&path);
+    text_body.append(&title_row);
+    text_body.append(&path);
+    body.append(&target_check);
+    body.append(&text_body);
 
     let click = gtk::GestureClick::new();
     click.set_button(1);
@@ -932,7 +974,7 @@ fn build_project_row(
             _ => {}
         });
     }
-    row.add_controller(click);
+    text_body.add_controller(click);
     row.set_child(Some(&body));
     (row, repo_status)
 }
@@ -952,8 +994,10 @@ fn update_project_ui(state: &SharedState) {
         projects_for_status,
         repo_busy_feedback,
         selected_index,
+        repo_action_target_paths,
         project_total,
         action_target_count,
+        repo_action_scope,
         repo_action_busy,
         refresh_busy,
         commit_push_enabled,
@@ -981,8 +1025,10 @@ fn update_project_ui(state: &SharedState) {
             state.projects.clone(),
             state.repo_busy_feedback.clone(),
             state.selected_project_index,
+            state.repo_action_target_paths.clone(),
             state.projects.len(),
             repo_action_targets_from_state(&state).len(),
+            current_repo_action_scope(&state),
             state.repo_action_busy,
             state.refresh_busy,
             commit_push_mode_from_state(&state).is_some(),
@@ -1009,7 +1055,7 @@ fn update_project_ui(state: &SharedState) {
     refresh_button.set_label(if refresh_busy {
         "Refreshing..."
     } else {
-        "Refresh"
+        "Refresh All"
     });
     if refresh_busy {
         refresh_button.add_css_class("busy-button");
@@ -1027,11 +1073,16 @@ fn update_project_ui(state: &SharedState) {
     } else {
         workspace_repo_status_label.remove_css_class("workspace-repo-status-busy");
     }
-    github_update_button.set_label(if repo_busy_kind == Some(RepoBusyKind::Sync) {
-        "Syncing..."
+    let github_update_label = if repo_busy_kind == Some(RepoBusyKind::Sync) {
+        "Syncing...".to_string()
     } else {
-        GITHUB_UPDATE_LABEL
-    });
+        match repo_action_scope {
+            RepoActionScope::Current => "Update Current".to_string(),
+            RepoActionScope::Marked => format!("Update Marked ({action_target_count})"),
+            RepoActionScope::All => "Update All".to_string(),
+        }
+    };
+    github_update_button.set_label(&github_update_label);
     commit_push_button.set_label(match repo_busy_kind {
         Some(RepoBusyKind::CommitPush) => "Commit+Push...",
         Some(RepoBusyKind::Push) => "Pushing...",
@@ -1057,7 +1108,12 @@ fn update_project_ui(state: &SharedState) {
         &projects_for_status,
         repo_busy_feedback.as_ref(),
     );
-    update_project_row_classes(&project_list, selected_index);
+    update_project_row_classes(
+        &project_list,
+        &projects_for_status,
+        selected_index,
+        &repo_action_target_paths,
+    );
     sync_dirty_changes_panel(state);
 }
 
@@ -1319,13 +1375,27 @@ fn describe_project_overview(projects: &[ProjectInfo]) -> String {
     }
 }
 
-fn update_project_row_classes(project_list: &ListBox, selected_index: Option<usize>) {
+fn update_project_row_classes(
+    project_list: &ListBox,
+    projects: &[ProjectInfo],
+    selected_index: Option<usize>,
+    repo_action_target_paths: &BTreeSet<PathBuf>,
+) {
     let mut index = 0;
     while let Some(row) = project_list.row_at_index(index) {
-        if selected_index == usize::try_from(index).ok() {
+        let project_index = usize::try_from(index).ok();
+        if selected_index == project_index {
             row.add_css_class("selected-project-row");
         } else {
             row.remove_css_class("selected-project-row");
+        }
+        if project_index
+            .and_then(|index| projects.get(index))
+            .is_some_and(|project| repo_action_target_paths.contains(&project.path))
+        {
+            row.add_css_class("targeted-project-row");
+        } else {
+            row.remove_css_class("targeted-project-row");
         }
         index += 1;
     }
@@ -1368,13 +1438,52 @@ fn toggle_project_selection(state: &SharedState, index: usize) {
     }
 }
 
+fn set_repo_action_target(
+    state: &SharedState,
+    project_name: String,
+    project_path: PathBuf,
+    targeted: bool,
+) {
+    let (target_count, repo_scope_combo) = {
+        let mut state_mut = state.borrow_mut();
+        if targeted {
+            state_mut
+                .repo_action_target_paths
+                .insert(project_path.clone());
+        } else {
+            state_mut.repo_action_target_paths.remove(&project_path);
+        }
+        (
+            state_mut.repo_action_target_paths.len(),
+            state_mut.repo_scope_combo.clone(),
+        )
+    };
+
+    if targeted {
+        repo_scope_combo.set_selected(1);
+    }
+
+    let action = if targeted { "marked" } else { "unmarked" };
+    push_status(
+        state,
+        format!("{action} repo for batch actions: {project_name} ({target_count} marked)"),
+    );
+    update_project_ui(state);
+}
+
 fn current_repo_action_scope(state: &AppState) -> RepoActionScope {
     RepoActionScope::from_index(state.repo_scope_combo.selected())
 }
 
 fn repo_action_targets_from_state(state: &AppState) -> Vec<ProjectInfo> {
     match current_repo_action_scope(state) {
-        RepoActionScope::Selected => selected_project_ref(state).cloned().into_iter().collect(),
+        RepoActionScope::Current => selected_project_ref(state).cloned().into_iter().collect(),
+        RepoActionScope::Marked => state
+            .projects
+            .iter()
+            .filter(|project| state.repo_action_target_paths.contains(&project.path))
+            .cloned()
+            .collect(),
         RepoActionScope::All => state.projects.clone(),
     }
 }
@@ -2721,9 +2830,13 @@ fn summarize_repo_update(scope: RepoActionScope, reports: &[RepoActionReport]) -
 
 fn describe_repo_scope_target_count(scope: RepoActionScope, count: usize) -> String {
     match scope {
-        RepoActionScope::Selected if count == 1 => "selected repo".to_string(),
+        RepoActionScope::Current if count == 1 => "current repo".to_string(),
+        RepoActionScope::Marked => format!(
+            "{count} marked {}",
+            if count == 1 { "repo" } else { "repos" }
+        ),
         RepoActionScope::All => format!("{count} {}", if count == 1 { "repo" } else { "repos" }),
-        RepoActionScope::Selected => {
+        RepoActionScope::Current => {
             format!("{count} {}", if count == 1 { "repo" } else { "repos" })
         }
     }
@@ -3336,6 +3449,14 @@ fn apply_css() {
         .selected-project-row .project-row-body {
             background: #094771;
             border-color: #0e639c;
+        }
+
+        .targeted-project-row:not(.selected-project-row) .project-row-body {
+            border-color: #6a9955;
+        }
+
+        .repo-target-check {
+            margin: 0;
         }
 
         .project-name,
