@@ -3046,7 +3046,9 @@ fn login_shell_environment() -> BTreeMap<String, String> {
 }
 
 fn apply_terminal_theme(terminal: &Terminal) {
-    let font = FontDescription::from_string("JetBrains Mono 11");
+    let font = FontDescription::from_string(
+        "JetBrains Mono, DejaVu Sans Mono, Liberation Mono, Noto Mono, monospace 11",
+    );
     terminal.set_font(Some(&font));
 
     let foreground = gdk::RGBA::parse("#d4d4d4").unwrap_or(gdk::RGBA::BLACK);
