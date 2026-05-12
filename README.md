@@ -136,6 +136,7 @@ If BelloSaize fetches successfully but skips the fast-forward for a repo, it sho
 2. `git commit -m ...`
 3. `git push`
 
+If Git has no commit identity configured and the repo has a `github.com` remote, BelloSaize asks the authenticated GitHub CLI account for the login and numeric user ID, then sets repo-local `user.name` and GitHub noreply `user.email` before committing. It does not modify global Git config.
 If the current branch has no upstream yet, BelloSaize falls back to `git push -u origin <branch>`.
 If the repo has no uncommitted changes but does have local commits ahead of upstream, BelloSaize skips the commit prompt and only runs the push step.
 

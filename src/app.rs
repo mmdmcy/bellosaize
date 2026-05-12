@@ -2352,7 +2352,9 @@ fn execute_commit_and_push_inner(cwd: &Path, message: Option<&str>) -> Result<St
     let mut transcript = Vec::new();
 
     if let Some(message) = message {
-        ensure_git_commit_identity(cwd)?;
+        if let Some(identity_step) = ensure_git_commit_identity(cwd)? {
+            transcript.push(identity_step);
+        }
         transcript.push(format_git_step(
             "git add -A",
             run_git_command(cwd, &["add", "-A"])?,
@@ -2391,10 +2393,127 @@ fn execute_commit_and_push_inner(cwd: &Path, message: Option<&str>) -> Result<St
     Ok(transcript.join("\n\n"))
 }
 
-fn ensure_git_commit_identity(cwd: &Path) -> Result<()> {
+struct GithubCliIdentity {
+    login: String,
+    id: String,
+}
+
+impl GithubCliIdentity {
+    fn noreply_email(&self) -> String {
+        format!("{}+{}@users.noreply.github.com", self.id, self.login)
+    }
+}
+
+fn ensure_git_commit_identity(cwd: &Path) -> Result<Option<String>> {
+    if run_git_command(cwd, &["var", "GIT_AUTHOR_IDENT"]).is_ok() {
+        return Ok(None);
+    }
+
+    let identity = github_cli_identity_for_repo(cwd).context(
+        "git commit identity is not configured, and BelloSaize could not configure one from GitHub CLI; set user.name and user.email or run gh auth login",
+    )?;
+    let email = identity.noreply_email();
+
+    run_git_command(cwd, &["config", "--local", "user.name", &identity.login])
+        .context("failed to set repo-local git user.name")?;
+    run_git_command(cwd, &["config", "--local", "user.email", &email])
+        .context("failed to set repo-local git user.email")?;
     run_git_command(cwd, &["var", "GIT_AUTHOR_IDENT"])
-        .map(|_| ())
-        .context("git commit identity is not configured; set user.name and user.email")
+        .context("repo-local git identity was configured but git still cannot create commits")?;
+
+    Ok(Some(format!(
+        "Configured repo-local Git identity from GitHub CLI\nuser.name={}\nuser.email={}",
+        identity.login, email
+    )))
+}
+
+fn github_cli_identity_for_repo(cwd: &Path) -> Result<GithubCliIdentity> {
+    if !repo_has_github_remote(cwd)? {
+        return Err(anyhow!(
+            "no github.com remote is configured for this repository"
+        ));
+    }
+
+    let output = run_gh_command(
+        cwd,
+        &["api", "user", "--jq", ".login + \"\\n\" + (.id | tostring)"],
+    )?;
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let login = lines
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("GitHub CLI did not return a login"))?
+        .to_string();
+    let id = lines
+        .next()
+        .filter(|value| value.chars().all(|ch| ch.is_ascii_digit()))
+        .ok_or_else(|| anyhow!("GitHub CLI did not return a numeric user id"))?
+        .to_string();
+
+    Ok(GithubCliIdentity { login, id })
+}
+
+fn repo_has_github_remote(cwd: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["remote", "-v"])
+        .output()
+        .with_context(|| format!("failed to run `git remote -v` in {}", cwd.display()))?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git remote -v exited with status {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(remote_line_is_github))
+}
+
+fn remote_line_is_github(line: &str) -> bool {
+    line.contains("github.com/") || line.contains("github.com:")
+}
+
+fn run_gh_command(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("gh")
+        .current_dir(cwd)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .args(args)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run `gh {}` in {}; install GitHub CLI and run gh auth login",
+                args.join(" "),
+                cwd.display()
+            )
+        })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if output.status.success() {
+        return Ok(stdout);
+    }
+
+    Err(anyhow!(
+        "gh {} exited with status {}{}\n{}",
+        args.join(" "),
+        output.status,
+        if stdout.is_empty() { "" } else { ":" },
+        [stdout, stderr]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
 }
 
 fn execute_github_update(
