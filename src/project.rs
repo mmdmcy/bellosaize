@@ -108,7 +108,7 @@ pub fn discover_projects(roots: &[PathBuf]) -> Vec<ProjectInfo> {
         }
     }
 
-    projects.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    projects.sort_by_key(|project| project.name.to_lowercase());
     projects
 }
 
@@ -141,6 +141,63 @@ pub fn inspect_project(path: &Path) -> RepoStatus {
 
 pub fn inspect_project_without_remote_refresh(path: &Path) -> RepoStatus {
     inspect_project_with_remote_refresh(path, false)
+}
+
+pub fn describe_pending_changes(path: &Path) -> Result<String, String> {
+    let status = git_stdout_with_error(path, &["status", "--short"])?;
+    if status.trim().is_empty() {
+        return Ok("No uncommitted changes.".to_string());
+    }
+
+    let branch = git_stdout_with_error(path, &["branch", "--show-current"])
+        .ok()
+        .and_then(|output| {
+            let branch = output.trim();
+            (!branch.is_empty()).then(|| branch.to_string())
+        })
+        .unwrap_or_else(|| "detached HEAD".to_string());
+    let has_head = git_stdout_with_error(path, &["rev-parse", "--verify", "HEAD"]).is_ok();
+    let untracked = git_stdout_with_error(path, &["ls-files", "--others", "--exclude-standard"])
+        .unwrap_or_default();
+
+    let mut sections = vec![
+        format!("Repository: {}\nBranch: {branch}", path.display()),
+        "Commit+Push will run `git add -A`, so every path in `git status --short` is included."
+            .to_string(),
+        format!("Status\n{}", status.trim()),
+    ];
+
+    if has_head {
+        let stat = git_stdout_with_error(path, &["diff", "--stat", "HEAD", "--"])?;
+        if !stat.trim().is_empty() {
+            sections.push(format!("Diffstat\n{}", stat.trim()));
+        }
+
+        if !untracked.trim().is_empty() {
+            sections.push(format!("Untracked files\n{}", untracked.trim()));
+        }
+
+        let diff = git_stdout_with_error(
+            path,
+            &["diff", "--no-ext-diff", "--submodule=short", "HEAD", "--"],
+        )?;
+        sections.push(if diff.trim().is_empty() {
+            "Tracked diff\nNo tracked file diff. Pending changes may be only untracked files."
+                .to_string()
+        } else {
+            format!("Tracked diff\n{}", diff.trim())
+        });
+    } else {
+        if !untracked.trim().is_empty() {
+            sections.push(format!("Untracked files\n{}", untracked.trim()));
+        }
+        sections.push(
+            "Tracked diff\nNo HEAD commit exists yet, so a diff against HEAD is unavailable."
+                .to_string(),
+        );
+    }
+
+    Ok(sections.join("\n\n"))
 }
 
 fn inspect_project_with_remote_refresh(path: &Path, refresh_remote: bool) -> RepoStatus {
@@ -220,9 +277,8 @@ fn parse_repo_status(output: &str) -> RepoStatus {
             continue;
         }
 
-        match line.chars().next() {
-            Some('1' | '2' | 'u' | '?') => status.dirty = true,
-            _ => {}
+        if let Some('1' | '2' | 'u' | '?') = line.chars().next() {
+            status.dirty = true;
         }
     }
 
@@ -239,6 +295,34 @@ fn git_stdout(path: &Path, args: &[&str]) -> Result<String, ()> {
 
     if !output.status.success() {
         return Err(());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn git_stdout_with_error(path: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .current_dir(path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to run `git {}` in {}: {error}",
+                args.join(" "),
+                path.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "git {} exited with status {}{}{}",
+            args.join(" "),
+            output.status,
+            if stderr.is_empty() { "" } else { "\n" },
+            stderr
+        ));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -303,5 +387,53 @@ mod tests {
         assert_eq!(status.ahead, 2);
         assert_eq!(status.behind, 3);
         assert!(status.has_upstream);
+    }
+
+    #[test]
+    fn describes_pending_changes_for_dirty_repo() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let repo = env::temp_dir().join(format!("bellosaize-changes-test-{unique}"));
+
+        fs::create_dir_all(&repo).expect("create repo dir");
+        Command::new("git")
+            .args(["init"])
+            .current_dir(&repo)
+            .output()
+            .expect("init git repo");
+        fs::write(repo.join("tracked.txt"), "one\n").expect("write tracked");
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&repo)
+            .output()
+            .expect("git add");
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=BelloSaize Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("git commit");
+
+        fs::write(repo.join("tracked.txt"), "two\n").expect("modify tracked");
+        fs::write(repo.join("untracked.txt"), "new\n").expect("write untracked");
+
+        let report = describe_pending_changes(&repo).expect("changes report");
+        assert!(report.contains("Status"));
+        assert!(report.contains("tracked.txt"));
+        assert!(report.contains("untracked.txt"));
+        assert!(report.contains("Tracked diff"));
+        assert!(report.contains("-one"));
+        assert!(report.contains("+two"));
+
+        let _ = fs::remove_dir_all(repo);
     }
 }

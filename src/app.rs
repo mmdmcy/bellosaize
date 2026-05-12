@@ -21,8 +21,8 @@ use vte::{CursorBlinkMode, PtyFlags, Terminal, prelude::*};
 use crate::{
     persist::{Profile, SessionFile, SessionSpec, load_or_bootstrap, save},
     project::{
-        ProjectInfo, RepoStatus, default_roots, discover_projects, inspect_project,
-        inspect_project_without_remote_refresh,
+        ProjectInfo, RepoStatus, default_roots, describe_pending_changes, discover_projects,
+        inspect_project, inspect_project_without_remote_refresh,
     },
 };
 
@@ -154,6 +154,10 @@ struct AppState {
     workspace_title_label: Label,
     workspace_path_label: Label,
     workspace_repo_status_label: Label,
+    dirty_changes_panel: GtkBox,
+    dirty_changes_title_label: Label,
+    dirty_changes_buffer: TextBuffer,
+    dirty_changes_refresh_button: Button,
     status_label: Label,
     count_label: Label,
     reset_button: Button,
@@ -176,6 +180,8 @@ struct AppState {
     repo_action_busy: bool,
     repo_busy_feedback: Option<RepoBusyFeedback>,
     refresh_busy: bool,
+    dirty_changes_for_path: Option<PathBuf>,
+    dirty_changes_loading_path: Option<PathBuf>,
 }
 
 struct SessionView {
@@ -220,6 +226,10 @@ struct WorkspaceWidgets {
     workspace_title_label: Label,
     workspace_path_label: Label,
     workspace_repo_status_label: Label,
+    dirty_changes_panel: GtkBox,
+    dirty_changes_title_label: Label,
+    dirty_changes_buffer: TextBuffer,
+    dirty_changes_refresh_button: Button,
     status_label: Label,
     count_label: Label,
     reset_button: Button,
@@ -267,6 +277,10 @@ fn build_ui(application: &Application) -> Result<()> {
         workspace_title_label: workspace_widgets.workspace_title_label,
         workspace_path_label: workspace_widgets.workspace_path_label,
         workspace_repo_status_label: workspace_widgets.workspace_repo_status_label,
+        dirty_changes_panel: workspace_widgets.dirty_changes_panel,
+        dirty_changes_title_label: workspace_widgets.dirty_changes_title_label,
+        dirty_changes_buffer: workspace_widgets.dirty_changes_buffer,
+        dirty_changes_refresh_button: workspace_widgets.dirty_changes_refresh_button.clone(),
         status_label: workspace_widgets.status_label,
         count_label: workspace_widgets.count_label,
         reset_button: workspace_widgets.reset_button.clone(),
@@ -289,6 +303,8 @@ fn build_ui(application: &Application) -> Result<()> {
         repo_action_busy: false,
         repo_busy_feedback: None,
         refresh_busy: false,
+        dirty_changes_for_path: None,
+        dirty_changes_loading_path: None,
     }));
 
     {
@@ -379,6 +395,11 @@ fn build_ui(application: &Application) -> Result<()> {
         let state = state.clone();
         let commit_push_button = state.borrow().commit_push_button.clone();
         commit_push_button.connect_clicked(move |_| prompt_commit_and_push(&state));
+    }
+    {
+        let state = state.clone();
+        let dirty_changes_refresh_button = state.borrow().dirty_changes_refresh_button.clone();
+        dirty_changes_refresh_button.connect_clicked(move |_| refresh_dirty_changes_panel(&state));
     }
     {
         let state = state.clone();
@@ -580,6 +601,13 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
     header.append(&title_row);
     header.append(&toolbar_row);
 
+    let (
+        dirty_changes_panel,
+        dirty_changes_title_label,
+        dirty_changes_buffer,
+        dirty_changes_refresh_button,
+    ) = build_dirty_changes_panel();
+
     let grid = Grid::builder()
         .column_spacing(8)
         .row_spacing(8)
@@ -613,6 +641,7 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
     let footer = build_footer();
 
     workspace.append(&header);
+    workspace.append(&dirty_changes_panel);
     workspace.append(&stage);
     workspace.append(&footer.2);
 
@@ -625,6 +654,10 @@ fn build_workspace() -> (GtkBox, WorkspaceWidgets) {
             workspace_title_label,
             workspace_path_label,
             workspace_repo_status_label,
+            dirty_changes_panel,
+            dirty_changes_title_label,
+            dirty_changes_buffer,
+            dirty_changes_refresh_button,
             status_label: footer.0,
             count_label: footer.1,
             reset_button,
@@ -680,6 +713,45 @@ fn build_footer() -> (Label, Label, GtkBox) {
     (status_label, count_label, footer)
 }
 
+fn build_dirty_changes_panel() -> (GtkBox, Label, TextBuffer, Button) {
+    let panel = GtkBox::new(Orientation::Vertical, 6);
+    panel.add_css_class("dirty-changes-panel");
+    panel.set_visible(false);
+
+    let header = GtkBox::new(Orientation::Horizontal, 8);
+    let title = Label::new(Some("Uncommitted changes"));
+    title.add_css_class("dirty-changes-title");
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+
+    let refresh_button = action_button("Refresh");
+    refresh_button.set_tooltip_text(Some("Reload the selected repo's uncommitted changes."));
+
+    header.append(&title);
+    header.append(&refresh_button);
+
+    let buffer = TextBuffer::new(None);
+    let text = TextView::new();
+    text.add_css_class("dirty-changes-text");
+    text.set_buffer(Some(&buffer));
+    text.set_editable(false);
+    text.set_monospace(true);
+    text.set_wrap_mode(gtk::WrapMode::None);
+
+    let scroller = ScrolledWindow::builder()
+        .min_content_height(190)
+        .hexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .child(&text)
+        .build();
+    scroller.add_css_class("dirty-changes-scroller");
+
+    panel.append(&header);
+    panel.append(&scroller);
+    (panel, title, buffer, refresh_button)
+}
+
 fn action_button(label: &str) -> Button {
     let button = Button::with_label(label);
     button.add_css_class("action-button");
@@ -715,6 +787,7 @@ fn refresh_projects(state: &SharedState) {
                 {
                     let mut state_mut = state.borrow_mut();
                     state_mut.projects = projects;
+                    state_mut.dirty_changes_for_path = None;
                     state_mut.selected_project_index = previous_path.and_then(|path| {
                         state_mut
                             .projects
@@ -743,18 +816,18 @@ fn refresh_projects(state: &SharedState) {
 
 fn load_projects(roots: &[PathBuf]) -> Vec<ProjectInfo> {
     let mut projects = discover_projects(roots);
-    if projects.is_empty() {
-        if let Ok(cwd) = env::current_dir() {
-            projects.push(ProjectInfo {
-                name: cwd
-                    .file_name()
-                    .and_then(|part| part.to_str())
-                    .unwrap_or("current")
-                    .to_string(),
-                repo_status: RepoStatus::default(),
-                path: cwd,
-            });
-        }
+    if projects.is_empty()
+        && let Ok(cwd) = env::current_dir()
+    {
+        projects.push(ProjectInfo {
+            name: cwd
+                .file_name()
+                .and_then(|part| part.to_str())
+                .unwrap_or("current")
+                .to_string(),
+            repo_status: RepoStatus::default(),
+            path: cwd,
+        });
     }
 
     for project in &mut projects {
@@ -985,6 +1058,146 @@ fn update_project_ui(state: &SharedState) {
         repo_busy_feedback.as_ref(),
     );
     update_project_row_classes(&project_list, selected_index);
+    sync_dirty_changes_panel(state);
+}
+
+fn sync_dirty_changes_panel(state: &SharedState) {
+    let (
+        panel,
+        title_label,
+        buffer,
+        refresh_button,
+        selected_project,
+        changes_for_path,
+        loading_path,
+        app_busy,
+    ) = {
+        let state_ref = state.borrow();
+        (
+            state_ref.dirty_changes_panel.clone(),
+            state_ref.dirty_changes_title_label.clone(),
+            state_ref.dirty_changes_buffer.clone(),
+            state_ref.dirty_changes_refresh_button.clone(),
+            selected_project_ref(&state_ref).cloned(),
+            state_ref.dirty_changes_for_path.clone(),
+            state_ref.dirty_changes_loading_path.clone(),
+            state_ref.repo_action_busy || state_ref.refresh_busy,
+        )
+    };
+
+    let Some(project) = selected_project else {
+        hide_dirty_changes_panel(state, &panel, &buffer);
+        return;
+    };
+
+    if !project.repo_status.dirty {
+        hide_dirty_changes_panel(state, &panel, &buffer);
+        return;
+    }
+
+    let loading_selected = loading_path
+        .as_ref()
+        .is_some_and(|path| path == &project.path);
+
+    panel.set_visible(true);
+    title_label.set_text(&format!("Uncommitted changes: {}", project.name));
+    refresh_button.set_label(if loading_selected {
+        "Refreshing..."
+    } else {
+        "Refresh"
+    });
+    if loading_selected {
+        refresh_button.add_css_class("busy-button");
+    } else {
+        refresh_button.remove_css_class("busy-button");
+    }
+    refresh_button.set_sensitive(!app_busy && !loading_selected);
+
+    if loading_selected
+        || changes_for_path
+            .as_ref()
+            .is_some_and(|path| path == &project.path)
+    {
+        return;
+    }
+
+    start_dirty_changes_load(state, project.path, project.name);
+}
+
+fn hide_dirty_changes_panel(state: &SharedState, panel: &GtkBox, buffer: &TextBuffer) {
+    panel.set_visible(false);
+    buffer.set_text("");
+
+    let mut state_mut = state.borrow_mut();
+    state_mut.dirty_changes_for_path = None;
+}
+
+fn refresh_dirty_changes_panel(state: &SharedState) {
+    let selected_project = {
+        let state_ref = state.borrow();
+        selected_project_ref(&state_ref)
+            .filter(|project| project.repo_status.dirty)
+            .cloned()
+    };
+
+    if let Some(project) = selected_project {
+        start_dirty_changes_load(state, project.path, project.name);
+    }
+}
+
+fn start_dirty_changes_load(state: &SharedState, path: PathBuf, name: String) {
+    let (buffer, refresh_button) = {
+        let mut state_mut = state.borrow_mut();
+        state_mut.dirty_changes_for_path = Some(path.clone());
+        state_mut.dirty_changes_loading_path = Some(path.clone());
+        (
+            state_mut.dirty_changes_buffer.clone(),
+            state_mut.dirty_changes_refresh_button.clone(),
+        )
+    };
+
+    buffer.set_text("Loading uncommitted changes...");
+    refresh_button.set_label("Refreshing...");
+    refresh_button.add_css_class("busy-button");
+    refresh_button.set_sensitive(false);
+
+    let job_path = path.clone();
+    let job = gio::spawn_blocking(move || describe_pending_changes(&job_path));
+    let state = state.clone();
+    glib::MainContext::default().spawn_local(async move {
+        let result = job.await;
+        let (buffer, still_selected) = {
+            let mut state_mut = state.borrow_mut();
+            if state_mut
+                .dirty_changes_loading_path
+                .as_ref()
+                .is_some_and(|loading_path| loading_path == &path)
+            {
+                state_mut.dirty_changes_loading_path = None;
+            }
+
+            let still_selected = selected_project_ref(&state_mut)
+                .is_some_and(|project| project.path == path && project.repo_status.dirty);
+            (state_mut.dirty_changes_buffer.clone(), still_selected)
+        };
+
+        if still_selected {
+            let report = match result {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    format!("Could not load changes for {}.\n\n{error}", path.display())
+                }
+                Err(_) => format!(
+                    "Could not load changes for {}.\n\nBackground git task panicked.",
+                    path.display()
+                ),
+            };
+            buffer.set_text(&report);
+            push_status(&state, format!("loaded changes for {name}"));
+        }
+
+        update_project_ui(&state);
+    });
 }
 
 fn workspace_repo_status_text(
@@ -1374,10 +1587,11 @@ fn prompt_custom_session(state: &SharedState, cwd_override: Option<PathBuf>) {
 
 #[allow(deprecated)]
 fn prompt_commit_and_push(state: &SharedState) {
-    if {
+    let app_busy = {
         let state = state.borrow();
         state.repo_action_busy || state.refresh_busy
-    } {
+    };
+    if app_busy {
         return;
     }
 
@@ -1567,14 +1781,14 @@ fn spawn_session(state: &SharedState, spec: SessionSpec) -> Result<()> {
         let state = state.clone();
         let session = session.clone();
         terminal.connect_current_directory_uri_changed(move |term| {
-            if let Some(uri) = term.current_directory_uri() {
-                if let Some(path) = gio::File::for_uri(&uri).path() {
-                    session.spec.borrow_mut().cwd = path.clone();
-                    session
-                        .subtitle_label
-                        .set_text(&session.spec.borrow().subtitle());
-                    let _ = persist_sessions(&state);
-                }
+            if let Some(uri) = term.current_directory_uri()
+                && let Some(path) = gio::File::for_uri(&uri).path()
+            {
+                session.spec.borrow_mut().cwd = path.clone();
+                session
+                    .subtitle_label
+                    .set_text(&session.spec.borrow().subtitle());
+                let _ = persist_sessions(&state);
             }
         });
     }
@@ -1879,10 +2093,11 @@ fn run_commit_and_push(
     mode: CommitPushMode,
     message: Option<String>,
 ) {
-    if {
+    let app_busy = {
         let state = state.borrow();
         state.repo_action_busy || state.refresh_busy
-    } {
+    };
+    if app_busy {
         return;
     }
 
@@ -2333,6 +2548,7 @@ fn apply_repo_action_reports(state: &SharedState, reports: &[RepoActionReport]) 
                 project.repo_status = report.repo_status.clone();
             }
         }
+        state.dirty_changes_for_path = None;
     }
     rebuild_project_list(state);
 }
@@ -2543,12 +2759,11 @@ fn parse_command(command: &str) -> Result<Vec<String>> {
 fn spawn_argv(spec: &SessionSpec) -> Result<Vec<String>> {
     let mut argv = parse_command(&spec.resolved_command())?;
 
-    if let Some(binary) = profile_binary_name(spec.profile) {
-        if argv.first().is_some_and(|arg| arg == binary) {
-            if let Some(resolved_path) = resolve_binary_from_shell(binary) {
-                argv[0] = resolved_path;
-            }
-        }
+    if let Some(binary) = profile_binary_name(spec.profile)
+        && argv.first().is_some_and(|arg| arg == binary)
+        && let Some(resolved_path) = resolve_binary_from_shell(binary)
+    {
+        argv[0] = resolved_path;
     }
 
     Ok(argv)
@@ -2643,12 +2858,18 @@ fn apply_repo_status_for_cwd(state: &SharedState, cwd: &Path, repo_status: RepoS
 
     {
         let mut state_mut = state.borrow_mut();
-        if let Some(project) = state_mut
+        let updated = if let Some(project) = state_mut
             .projects
             .iter_mut()
             .find(|project| project.path == repo_path)
         {
             project.repo_status = repo_status;
+            true
+        } else {
+            false
+        };
+        if updated {
+            state_mut.dirty_changes_for_path = None;
         }
     }
 
@@ -2828,15 +3049,15 @@ fn apply_terminal_theme(terminal: &Terminal) {
     let font = FontDescription::from_string("JetBrains Mono 11");
     terminal.set_font(Some(&font));
 
-    let foreground = gdk::RGBA::parse("#d4d4d4").unwrap_or_else(|_| gdk::RGBA::BLACK);
-    let background = gdk::RGBA::parse("#1e1e1e").unwrap_or_else(|_| gdk::RGBA::WHITE);
+    let foreground = gdk::RGBA::parse("#d4d4d4").unwrap_or(gdk::RGBA::BLACK);
+    let background = gdk::RGBA::parse("#1e1e1e").unwrap_or(gdk::RGBA::WHITE);
     let palette_values = [
         "#1e1e1e", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#e5e5e5",
         "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff",
     ];
     let palette = palette_values
         .iter()
-        .map(|value| gdk::RGBA::parse(*value).unwrap_or_else(|_| gdk::RGBA::BLACK))
+        .map(|value| gdk::RGBA::parse(*value).unwrap_or(gdk::RGBA::BLACK))
         .collect::<Vec<_>>();
     let palette_refs = palette.iter().collect::<Vec<_>>();
 
@@ -2860,6 +3081,7 @@ fn apply_css() {
 
         .sidebar-header,
         .workspace-header,
+        .dirty-changes-panel,
         .workspace-stage,
         .session-card {
             background: #1e1e1e;
@@ -2938,6 +3160,27 @@ fn apply_css() {
 
         .workspace-header {
             padding: 8px;
+        }
+
+        .dirty-changes-panel {
+            padding: 8px;
+        }
+
+        .dirty-changes-title {
+            color: #cccccc;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .dirty-changes-scroller {
+            background: #181818;
+            border: 1px solid #2d2d2d;
+        }
+
+        .dirty-changes-text {
+            color: #d4d4d4;
+            background: #181818;
+            font-size: 12px;
         }
 
         .toolbar-group {
