@@ -183,6 +183,7 @@ struct AppState {
     repo_action_busy: bool,
     repo_busy_feedback: Option<RepoBusyFeedback>,
     refresh_busy: bool,
+    busy_frame: usize,
     dirty_changes_for_path: Option<PathBuf>,
     dirty_changes_loading_path: Option<PathBuf>,
 }
@@ -307,6 +308,7 @@ fn build_ui(application: &Application) -> Result<()> {
         repo_action_busy: false,
         repo_busy_feedback: None,
         refresh_busy: false,
+        busy_frame: 0,
         dirty_changes_for_path: None,
         dirty_changes_loading_path: None,
     }));
@@ -1000,6 +1002,7 @@ fn update_project_ui(state: &SharedState) {
         repo_action_scope,
         repo_action_busy,
         refresh_busy,
+        busy_frame,
         commit_push_enabled,
         selected_title,
         selected_path,
@@ -1031,6 +1034,7 @@ fn update_project_ui(state: &SharedState) {
             current_repo_action_scope(&state),
             state.repo_action_busy,
             state.refresh_busy,
+            state.busy_frame,
             commit_push_mode_from_state(&state).is_some(),
             selected
                 .map(|project| project.name.clone())
@@ -1050,12 +1054,16 @@ fn update_project_ui(state: &SharedState) {
     };
     let app_busy = repo_action_busy || refresh_busy;
     let repo_busy_kind = repo_busy_feedback.as_ref().map(|feedback| feedback.kind);
+    let repo_busy_frame = repo_busy_feedback
+        .as_ref()
+        .map(|feedback| feedback.frame)
+        .unwrap_or(busy_frame);
 
     project_count_label.set_text(&describe_project_count(project_total));
-    refresh_button.set_label(if refresh_busy {
-        "Refreshing..."
+    refresh_button.set_label(&if refresh_busy {
+        spinner_label(busy_frame, "Refreshing")
     } else {
-        "Refresh All"
+        "Refresh All".to_string()
     });
     if refresh_busy {
         refresh_button.add_css_class("busy-button");
@@ -1074,7 +1082,7 @@ fn update_project_ui(state: &SharedState) {
         workspace_repo_status_label.remove_css_class("workspace-repo-status-busy");
     }
     let github_update_label = if repo_busy_kind == Some(RepoBusyKind::Sync) {
-        "Syncing...".to_string()
+        spinner_label(repo_busy_frame, "Syncing")
     } else {
         match repo_action_scope {
             RepoActionScope::Current => "Update Current".to_string(),
@@ -1083,11 +1091,12 @@ fn update_project_ui(state: &SharedState) {
         }
     };
     github_update_button.set_label(&github_update_label);
-    commit_push_button.set_label(match repo_busy_kind {
-        Some(RepoBusyKind::CommitPush) => "Commit+Push...",
-        Some(RepoBusyKind::Push) => "Pushing...",
-        _ => "Commit+Push",
-    });
+    let commit_push_label = match repo_busy_kind {
+        Some(RepoBusyKind::CommitPush) => spinner_label(repo_busy_frame, "Commit+Push"),
+        Some(RepoBusyKind::Push) => spinner_label(repo_busy_frame, "Pushing"),
+        _ => "Commit+Push".to_string(),
+    };
+    commit_push_button.set_label(&commit_push_label);
     if repo_busy_kind == Some(RepoBusyKind::Sync) {
         github_update_button.add_css_class("busy-button");
     } else {
@@ -1126,6 +1135,7 @@ fn sync_dirty_changes_panel(state: &SharedState) {
         selected_project,
         changes_for_path,
         loading_path,
+        busy_frame,
         app_busy,
     ) = {
         let state_ref = state.borrow();
@@ -1137,6 +1147,7 @@ fn sync_dirty_changes_panel(state: &SharedState) {
             selected_project_ref(&state_ref).cloned(),
             state_ref.dirty_changes_for_path.clone(),
             state_ref.dirty_changes_loading_path.clone(),
+            state_ref.busy_frame,
             state_ref.repo_action_busy || state_ref.refresh_busy,
         )
     };
@@ -1157,10 +1168,10 @@ fn sync_dirty_changes_panel(state: &SharedState) {
 
     panel.set_visible(true);
     title_label.set_text(&format!("Uncommitted changes: {}", project.name));
-    refresh_button.set_label(if loading_selected {
-        "Refreshing..."
+    refresh_button.set_label(&if loading_selected {
+        spinner_label(busy_frame, "Refreshing")
     } else {
-        "Refresh"
+        "Refresh".to_string()
     });
     if loading_selected {
         refresh_button.add_css_class("busy-button");
@@ -1173,6 +1184,7 @@ fn sync_dirty_changes_panel(state: &SharedState) {
         || changes_for_path
             .as_ref()
             .is_some_and(|path| path == &project.path)
+        || app_busy
     {
         return;
     }
@@ -1206,6 +1218,7 @@ fn start_dirty_changes_load(state: &SharedState, path: PathBuf, name: String) {
         let mut state_mut = state.borrow_mut();
         state_mut.dirty_changes_for_path = Some(path.clone());
         state_mut.dirty_changes_loading_path = Some(path.clone());
+        state_mut.busy_frame = 0;
         (
             state_mut.dirty_changes_buffer.clone(),
             state_mut.dirty_changes_refresh_button.clone(),
@@ -1213,15 +1226,17 @@ fn start_dirty_changes_load(state: &SharedState, path: PathBuf, name: String) {
     };
 
     buffer.set_text("Loading uncommitted changes...");
-    refresh_button.set_label("Refreshing...");
+    refresh_button.set_label(&spinner_label(0, "Refreshing"));
     refresh_button.add_css_class("busy-button");
     refresh_button.set_sensitive(false);
+    let spinner_id = start_busy_button_spinner(state);
 
     let job_path = path.clone();
     let job = gio::spawn_blocking(move || describe_pending_changes(&job_path));
     let state = state.clone();
     glib::MainContext::default().spawn_local(async move {
         let result = job.await;
+        spinner_id.remove();
         let (buffer, still_selected) = {
             let mut state_mut = state.borrow_mut();
             if state_mut
@@ -1296,6 +1311,10 @@ fn repo_status_label_text(
         SPINNER_FRAMES[feedback.frame],
         feedback.kind.status_label()
     ))
+}
+
+fn spinner_label(frame: usize, label: &str) -> String {
+    format!("{} {}", SPINNER_FRAMES[frame % SPINNER_FRAMES.len()], label)
 }
 
 fn repo_feedback_targets_project(feedback: Option<&RepoBusyFeedback>, project_path: &Path) -> bool {
@@ -3142,14 +3161,33 @@ fn start_status_spinner(
 ) -> glib::SourceId {
     let status_label = state.borrow().status_label.clone();
     status_label.set_tooltip_text(details.as_deref());
+    state.borrow_mut().busy_frame = 0;
 
     let frame_index = Cell::new(0usize);
-    status_label.set_text(&format!("{} {}", SPINNER_FRAMES[0], message));
+    status_label.set_text(&spinner_label(0, &message));
 
+    let state = state.clone();
     glib::timeout_add_local(Duration::from_millis(120), move || {
         let next = (frame_index.get() + 1) % SPINNER_FRAMES.len();
         frame_index.set(next);
-        status_label.set_text(&format!("{} {}", SPINNER_FRAMES[next], message));
+        {
+            let mut state_mut = state.borrow_mut();
+            state_mut.busy_frame = next;
+        }
+        status_label.set_text(&spinner_label(next, &message));
+        update_project_ui(&state);
+        glib::ControlFlow::Continue
+    })
+}
+
+fn start_busy_button_spinner(state: &SharedState) -> glib::SourceId {
+    let state = state.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        {
+            let mut state_mut = state.borrow_mut();
+            state_mut.busy_frame = (state_mut.busy_frame + 1) % SPINNER_FRAMES.len();
+        }
+        update_project_ui(&state);
         glib::ControlFlow::Continue
     })
 }
@@ -3366,15 +3404,23 @@ fn apply_css() {
             background: #37373d;
         }
 
+        .action-button:active:not(:disabled) {
+            background: #094771;
+            border-color: #0e639c;
+            color: #ffffff;
+        }
+
         .action-button:disabled {
             opacity: 0.45;
         }
 
+        .busy-button,
         .busy-button:disabled {
             opacity: 1;
-            background: #094771;
-            border-color: #0e639c;
+            background: #0e639c;
+            border-color: #4fc1ff;
             color: #ffffff;
+            box-shadow: inset 0 0 0 1px #4fc1ff;
         }
 
         .primary-button:not(:disabled) {
